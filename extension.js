@@ -734,6 +734,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                     try {
                         this._warpPointerToMonitor(monitorSortIndex);
                     } catch (e) {
+                        console.error(`[MultiMonitorsWorkspace] _warpPointerToMonitor(${monitorSortIndex}) failed:`, e);
                         this._debugLog(`EXCEPTION in _warpPointerToMonitor(${monitorSortIndex}): ${e.message}`);
                     }
                     // Show popup banner
@@ -1207,6 +1208,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         try {
             this._warpPointerToMonitor(targetMonitor);
         } catch (e) {
+            console.error(`[MultiMonitorsWorkspace] _warpPointerToMonitor(${targetMonitor}) failed:`, e);
             this._debugLog(`EXCEPTION in _warpPointerToMonitor: ${e.message}`);
             this._debugLog(`STACK: ${e.stack}`);
         }
