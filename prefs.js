@@ -804,6 +804,105 @@ export default class MultiMonitorsWorkspacePreferences extends ExtensionPreferen
             warpGroup.add(row);
         }
 
+        // Which workspace each monitor shows after login
+        const startupGroup = new Adw.PreferencesGroup({
+            title: 'Startup Workspace per Monitor',
+            description: 'Which workspace each monitor shows after logging in. "Auto" gives the primary ' +
+                'monitor the workspace that is currently active and the other monitors the next free ones. ' +
+                'Two monitors can never end up on the same workspace.',
+        });
+        page.add(startupGroup);
+
+        // Read the current assignment so we can pre-select the rows
+        let configuredMap = new Map();
+        try {
+            const stored = settings.get_strv('monitor-workspace-map');
+            if (stored.length > 0) {
+                const parsed = JSON.parse(stored[0]);
+                if (Array.isArray(parsed)) {
+                    for (const entry of parsed) {
+                        if (Number.isInteger(entry?.monitor) && Number.isInteger(entry?.workspace)) {
+                            configuredMap.set(entry.monitor, entry.workspace);
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            // Broken value: start over with everything on Auto
+            configuredMap = new Map();
+        }
+
+        // Workspace names: index 0 is "Workspace 1" for the user.
+        // NOTE: build the list with append() - new Gtk.StringList([...]) tries to
+        // interpret the array as construct properties and throws.
+        const workspaceLabels = ['Auto'];
+        for (let w = 1; w <= 10; w++) workspaceLabels.push(`Workspace ${w}`);
+
+        // A combo row per connected monitor. "Auto" means index -1 internally.
+        const rowsForMonitors = [];
+        for (const monitor of Array.from({length: nMonitors}, (_, idx) => idx)) {
+            const workspaceModel = new Gtk.StringList();
+            for (const label of workspaceLabels) workspaceModel.append(label);
+
+            const row = new Adw.ComboRow({
+                title: `Monitor ${monitor}`,
+                subtitle: monitor === 0
+                    ? 'Leftmost by default. "Auto" keeps the workspace you are on when you log in'
+                    : 'Leave on "Auto" to be assigned the next free workspace',
+                model: workspaceModel,
+            });
+
+            const configured = configuredMap.get(monitor);
+            row.set_selected(configured === undefined ? 0 : configured + 1);
+
+            row.connect('notify::selected', () => {
+                const selected = row.get_selected();
+
+                // Rebuild the whole map from the current row values so removing
+                // an assignment on one monitor does not clobber the others
+                const next = new Map(configuredMap);
+                if (selected === 0) {
+                    next.delete(monitor);
+                } else {
+                    next.set(monitor, selected - 1);
+                }
+
+                // Two monitors may not share a workspace. The monitor the user
+                // just changed wins, any other monitor holding that workspace
+                // falls back to Auto.
+                const seen = new Set();
+                const ordered = [[monitor, next.get(monitor)], ...[...next]
+                    .filter(([mon]) => mon !== monitor)
+                    .sort((a, b) => a[0] - b[0])];
+                for (const [mon, ws] of ordered) {
+                    if (next.get(mon) === undefined) continue;
+                    if (seen.has(ws)) {
+                        next.delete(mon);
+                    } else {
+                        seen.add(ws);
+                    }
+                }
+
+                const payload = JSON.stringify(
+                    [...next].sort((a, b) => a[0] - b[0]).map(([mon, ws]) => ({ monitor: mon, workspace: ws }))
+                );
+                settings.set_strv('monitor-workspace-map', payload);
+
+                // Keep the in-memory copy in sync and reflect the change in the
+                // other rows, since one of them may have been dropped above
+                configuredMap.clear();
+                for (const [mon, ws] of next) configuredMap.set(mon, ws);
+                for (const other of rowsForMonitors) {
+                    if (other.monitor === monitor) continue;
+                    const ws = configuredMap.get(other.monitor);
+                    other.row.set_selected(ws === undefined ? 0 : ws + 1);
+                }
+            });
+
+            rowsForMonitors.push({ monitor, row });
+            startupGroup.add(row);
+        }
+
         // Relative navigation: warp pointer and focus to the neighbouring monitor
         const adjacentWarpGroup = new Adw.PreferencesGroup({
             title: 'Warp to Adjacent Monitor',

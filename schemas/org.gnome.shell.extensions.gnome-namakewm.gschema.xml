@@ -171,6 +171,12 @@
       <description>When switching to a workspace already shown on another monitor: 'swap' exchanges workspaces between monitors, 'warp' moves pointer to that monitor instead</description>
     </key>
 
+    <!-- Which workspace each monitor shows after login -->
+    <key name="monitor-workspace-map" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Workspace shown on each monitor at startup</summary>
+      <description>JSON array of {"monitor":N,"workspace":N} entries defining which workspace each monitor displays after login. An empty list means automatic: the primary monitor keeps the workspace that is currently active and every other monitor gets the next free one. Workspaces are zero-based indices as used everywhere else, so workspace 1 in the UI is index 0</description>
+    </key>
 
     <!-- Cycle focus within current workspace -->
     <key name="mmw-cycle-focus-forward" type="as">

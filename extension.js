@@ -496,6 +496,86 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         }
     }
 
+    // Read the user's per-monitor startup assignment from GSettings.
+    // Returns Map<monitor, workspace>. Malformed entries, entries for monitors
+    // that do not exist and duplicate workspaces are all dropped, so a bad
+    // value degrades to "automatic" instead of breaking the mapping.
+    _readConfiguredWorkspaceMap(nMonitors, nWorkspaces) {
+        const result = new Map();
+        const used = new Set();
+
+        let raw = [];
+        try {
+            const stored = this._settings.get_strv('monitor-workspace-map');
+            if (stored.length > 0) {
+                raw = JSON.parse(stored[0]);
+            }
+        } catch (e) {
+            console.error('[MultiMonitorsWorkspace] Failed to parse monitor-workspace-map:', e.message);
+            return result;
+        }
+
+        if (!Array.isArray(raw)) {
+            if (raw.length > 0)
+                console.error('[MultiMonitorsWorkspace] monitor-workspace-map is not an array, ignoring');
+            return result;
+        }
+
+        for (const entry of raw) {
+            const mon = entry?.monitor;
+            const ws = entry?.workspace;
+            if (!Number.isInteger(mon) || !Number.isInteger(ws)) {
+                console.error(`[MultiMonitorsWorkspace] Ignoring malformed monitor-workspace-map entry: ${JSON.stringify(entry)}`);
+                continue;
+            }
+            if (mon < 0 || mon >= nMonitors) {
+                console.error(`[MultiMonitorsWorkspace] monitor-workspace-map references non-existent M${mon}, ignoring`);
+                continue;
+            }
+            if (ws < 0 || ws >= nWorkspaces) {
+                console.error(`[MultiMonitorsWorkspace] monitor-workspace-map references non-existent WS${ws}, ignoring`);
+                continue;
+            }
+            if (used.has(ws)) {
+                console.error(`[MultiMonitorsWorkspace] WS${ws} configured for two monitors, first wins, ignoring M${mon}`);
+                continue;
+            }
+            used.add(ws);
+            result.set(mon, ws);
+        }
+
+        return result;
+    }
+
+    // Hand out distinct workspaces to the monitors that do not have one yet.
+    // Starts counting at `startWs` (normally the active workspace + 1) so the
+    // monitors end up with a contiguous block around where the user already is.
+    // Never returns a workspace already in `used`, unless every single
+    // workspace is taken (more monitors than workspaces) - that case is logged
+    // and the remaining monitors share a workspace rather than looping forever.
+    _assignFreeWorkspaces(targets, nWorkspaces, used, startWs = 0) {
+        const nextWs = (ws) => (ws + 1) % nWorkspaces;
+        let candidate = ((startWs % nWorkspaces) + nWorkspaces) % nWorkspaces;
+
+        for (const mon of targets) {
+            // Bound the search so we cannot spin forever
+            let attempts = 0;
+            while (used.has(candidate) && attempts < nWorkspaces) {
+                candidate = nextWs(candidate);
+                attempts++;
+            }
+
+            if (used.has(candidate)) {
+                console.error(`[MultiMonitorsWorkspace] All ${nWorkspaces} workspaces are already assigned; M${mon} has to share one`);
+                continue;
+            }
+
+            this._monitorWorkspaceMap.set(mon, candidate);
+            used.add(candidate);
+            candidate = nextWs(candidate);
+        }
+    }
+
     _initializeMapping() {
         const nMonitors = global.display.get_n_monitors();
         const primaryMonitor = global.display.get_primary_monitor();
@@ -511,22 +591,102 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         // Ensure we have enough workspaces
         this._ensureWorkspaceExists(9);
+        const nWorkspaces = Math.max(global.workspace_manager.get_n_workspaces(), 1);
 
-        // Initialize: all monitors start showing the current global workspace
-        // Then assign different workspaces based on which windows are on each monitor
+        this._monitorWorkspaceMap.clear();
+
+        // Honour the user's per-monitor assignment first
+        const configured = this._readConfiguredWorkspaceMap(nMonitors, nWorkspaces);
+        const used = new Set();
+        for (const [mon, ws] of configured) {
+            this._monitorWorkspaceMap.set(mon, ws);
+            used.add(ws);
+        }
+        if (configured.size > 0) {
+            console.log(`[MultiMonitorsWorkspace] Using configured startup mapping: ${JSON.stringify([...configured])}`);
+        }
+
+        // The primary keeps whatever is active right now unless the user picked
+        // one explicitly - reassigning it would visibly move the desktop.
+        let primaryWs = currentWs;
+        if (primaryWs < 0 || primaryWs >= nWorkspaces) primaryWs = 0;
+        if (!this._monitorWorkspaceMap.has(primaryMonitor)) {
+            this._monitorWorkspaceMap.set(primaryMonitor, primaryWs);
+            used.add(primaryWs);
+        }
+
+        // Everything else gets whatever is left, counting up from the workspace
+        // the user is on so the monitors end up as one contiguous block.
+        const unassigned = [];
         for (let i = 0; i < nMonitors; i++) {
-            if (i === primaryMonitor) {
-                // Primary monitor shows current global workspace
-                this._monitorWorkspaceMap.set(i, currentWs);
-            } else {
-                // Secondary monitors: check if there are windows on them
-                // For now, assign sequential workspaces
-                const wsIndex = (currentWs + i) % 10;
-                this._monitorWorkspaceMap.set(i, wsIndex);
+            if (!this._monitorWorkspaceMap.has(i)) unassigned.push(i);
+        }
+        this._assignFreeWorkspaces(unassigned, nWorkspaces, used, primaryWs + 1);
+
+        this._logMappings('Initial');
+    }
+
+    // Handle a monitor being plugged in or removed.
+    // The monitors that are still connected keep the workspace they were
+    // showing - unplugging one must not reshuffle the whole desktop. Only
+    // monitors that are new (or vanished) are touched.
+    _reassignAfterMonitorChange() {
+        const nMonitors = global.display.get_n_monitors();
+        const primaryMonitor = global.display.get_primary_monitor();
+
+        // Drop monitors that are gone
+        for (const mon of [...this._monitorWorkspaceMap.keys()]) {
+            if (mon >= nMonitors) {
+                console.log(`[MultiMonitorsWorkspace] M${mon} disconnected, dropping from mapping`);
+                this._monitorWorkspaceMap.delete(mon);
             }
         }
 
-        this._logMappings('Initial');
+        const used = new Set(this._monitorWorkspaceMap.values());
+
+        // The primary may have changed identity
+        if (!this._monitorWorkspaceMap.has(primaryMonitor) && nMonitors > 0) {
+            let primaryWs = global.workspace_manager.get_active_workspace_index();
+            const nWorkspaces = Math.max(global.workspace_manager.get_n_workspaces(), 1);
+            if (primaryWs < 0 || primaryWs >= nWorkspaces) primaryWs = 0;
+            if (used.has(primaryWs)) {
+                // Its slot is taken, let the generic assignment deal with it
+                this._debugLog(`Primary is now M${primaryMonitor}, but WS${primaryWs} is already in use`);
+            } else {
+                console.log(`[MultiMonitorsWorkspace] Primary is now M${primaryMonitor}, giving it WS${primaryWs}`);
+                this._monitorWorkspaceMap.set(primaryMonitor, primaryWs);
+                used.add(primaryWs);
+            }
+        }
+
+        // Only fill in monitors we have never seen
+        const nWorkspaces = Math.max(global.workspace_manager.get_n_workspaces(), 1);
+        const fresh = [];
+        for (let i = 0; i < nMonitors; i++) {
+            if (!this._monitorWorkspaceMap.has(i)) fresh.push(i);
+        }
+        if (fresh.length === 0) {
+            this._logMappings('After monitor change');
+            return;
+        }
+
+        // Give newly connected monitors their configured workspace if that is
+        // still free, otherwise hand out the next free one.
+        const configured = this._readConfiguredWorkspaceMap(nMonitors, nWorkspaces);
+        const stillNeedsSlot = [];
+        for (const mon of fresh) {
+            const ws = configured.get(mon);
+            if (ws !== undefined && !used.has(ws)) {
+                console.log(`[MultiMonitorsWorkspace] New M${mon} takes its configured WS${ws}`);
+                this._monitorWorkspaceMap.set(mon, ws);
+                used.add(ws);
+            } else {
+                stillNeedsSlot.push(mon);
+            }
+        }
+        this._assignFreeWorkspaces(stillNeedsSlot, nWorkspaces, used);
+
+        this._logMappings('After monitor change');
     }
 
     _registerKeybindings() {
@@ -1363,16 +1523,15 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
     _connectSignals() {
         const monitorManager = global.backend.get_monitor_manager();
         const id1 = monitorManager.connect('monitors-changed', () => {
-            console.log('[MultiMonitorsWorkspace] Monitors changed, reinitializing...');
-            this._monitorWorkspaceMap.clear();
-            this._initializeMapping();
+            console.log('[MultiMonitorsWorkspace] Monitors changed, reassigning...');
+            this._reassignAfterMonitorChange();
 
             // Rebuild workspace indicator
             if (this._indicatorManager) {
                 this._indicatorManager.rebuild(this._monitorWorkspaceMap);
             }
         });
-        this._signalIds.push({ obj: monitorManager, id: id1 });        this._signalIds.push({ obj: monitorManager, id: id1 });
+        this._signalIds.push({ obj: monitorManager, id: id1 });
 
         // Listen for debug-mode setting changes
         const id2 = this._settings.connect('changed::debug-mode', () => {
