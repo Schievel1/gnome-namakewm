@@ -134,12 +134,21 @@
       <description>Show workspace indicator in the top panel displaying workspace numbers for each monitor</description>
     </key>
 
+    <!-- Force the panel indicator into a single row -->
+    <key name="flat-panel-indicator" type="b">
+      <default>true</default>
+      <summary>Flatten the panel indicator into a single row</summary>
+      <description>Show all monitors in one horizontal row, ordered left to right. When disabled the indicator is grouped into rows by vertical position, which stacks monitors on different heights - for example a portrait monitor next to landscape ones - into several panel rows</description>
+    </key>
+
     <!-- Warp pointer to focused window -->
     <key name="warp-pointer-to-focus" type="b">
       <default>true</default>
       <summary>Warp pointer to focused window</summary>
       <description>When focus changes via keyboard (Alt+Tab, dock, etc.), move pointer to the center of the newly focused window</description>
     </key>
+
+
 
     <!-- Raise window on cycle focus -->
     <key name="raise-on-cycle-focus" type="b">
@@ -161,6 +170,7 @@
       <summary>Workspace switch mode</summary>
       <description>When switching to a workspace already shown on another monitor: 'swap' exchanges workspaces between monitors, 'warp' moves pointer to that monitor instead</description>
     </key>
+
 
     <!-- Cycle focus within current workspace -->
     <key name="mmw-cycle-focus-forward" type="as">

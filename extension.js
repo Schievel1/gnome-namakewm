@@ -136,6 +136,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         this._updateWorkspaceKeybindingSettings();
         this._overrideSystemKeybindings();
         this._initializeMapping();
+        this._initializeMapping();
         this._registerKeybindings();
         this._connectSignals();
 
@@ -144,7 +145,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         // Create workspace indicator in top bar (if enabled in settings)
         if (this._settings.get_boolean('show-workspace-indicator')) {
-            this._indicatorManager = new WorkspaceIndicatorManager(this.metadata.uuid);
+            this._indicatorManager = new WorkspaceIndicatorManager(this.metadata.uuid, this._settings.get_boolean('flat-panel-indicator'));
             this._indicatorManager.create(this._monitorWorkspaceMap);
         }
 
@@ -1371,7 +1372,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 this._indicatorManager.rebuild(this._monitorWorkspaceMap);
             }
         });
-        this._signalIds.push({ obj: monitorManager, id: id1 });
+        this._signalIds.push({ obj: monitorManager, id: id1 });        this._signalIds.push({ obj: monitorManager, id: id1 });
 
         // Listen for debug-mode setting changes
         const id2 = this._settings.connect('changed::debug-mode', () => {
@@ -1392,7 +1393,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             if (showIndicator) {
                 // Create indicator if not exists
                 if (!this._indicatorManager) {
-                    this._indicatorManager = new WorkspaceIndicatorManager(this.metadata.uuid);
+                    this._indicatorManager = new WorkspaceIndicatorManager(this.metadata.uuid, this._settings.get_boolean('flat-panel-indicator'));
                     this._indicatorManager.create(this._monitorWorkspaceMap);
                 }
             } else {
@@ -1404,6 +1405,16 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             }
         });
         this._signalIds.push({ obj: this._settings, id: indicatorSettingId });
+
+        // Switching the flat layout only needs a rebuild of the panel button
+        const flatIndicatorId = this._settings.connect('changed::flat-panel-indicator', () => {
+            const flat = this._settings.get_boolean('flat-panel-indicator');
+            console.log(`[MultiMonitorsWorkspace] Flat panel indicator: ${flat}`);
+            if (!this._indicatorManager) return;
+            this._indicatorManager.setFlatIndicator(flat);
+            this._indicatorManager.rebuild(this._monitorWorkspaceMap);
+        });
+        this._signalIds.push({ obj: this._settings, id: flatIndicatorId });
 
         // Listen for workspace-modifier setting changes
         const modifierSettingId = this._settings.connect('changed::workspace-modifier', () => {

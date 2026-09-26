@@ -639,6 +639,21 @@ export default class MultiMonitorsWorkspacePreferences extends ExtensionPreferen
             Gio.SettingsBindFlags.DEFAULT
         );
 
+        // Flat single-row layout for the panel indicator
+        const flatIndicatorRow = new Adw.SwitchRow({
+            title: 'Flat Panel Indicator',
+            subtitle: 'Show all monitors in one row, left to right. Turn this off to ' +
+                'group them into several panel rows by vertical position',
+        });
+        behaviorGroup.add(flatIndicatorRow);
+
+        settings.bind(
+            'flat-panel-indicator',
+            flatIndicatorRow,
+            'active',
+            Gio.SettingsBindFlags.DEFAULT
+        );
+
         // Warp pointer toggle
         const warpPointerRow = new Adw.SwitchRow({
             title: 'Warp Pointer to Focus',
