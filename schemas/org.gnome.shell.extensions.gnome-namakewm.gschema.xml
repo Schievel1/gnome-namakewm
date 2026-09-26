@@ -192,7 +192,7 @@
     <key name="mmw-warp-to-monitor-0" type="as">
       <default><![CDATA[[]]]></default>
       <summary>Warp pointer to monitor 1</summary>
-      <description>Keybinding to warp pointer to the center of monitor 1 (leftmost)</description>
+      <description>Keybinding to warp pointer to the center of monitor 1</description>
     </key>
 
     <key name="mmw-warp-to-monitor-1" type="as">
@@ -235,6 +235,56 @@
       <default><![CDATA[[]]]></default>
       <summary>Warp pointer to monitor 8</summary>
       <description>Keybinding to warp pointer to the center of monitor 8</description>
+    </key>
+
+    <!-- Relative monitor navigation: warp pointer and focus to the neighbour -->
+    <key name="mmw-warp-to-adjacent-left" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Warp to the monitor on the left</summary>
+      <description>Keybinding to move the pointer and focus to the neighbouring monitor to the left</description>
+    </key>
+
+    <key name="mmw-warp-to-adjacent-right" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Warp to the monitor on the right</summary>
+      <description>Keybinding to move the pointer and focus to the neighbouring monitor to the right</description>
+    </key>
+
+    <key name="mmw-warp-to-adjacent-up" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Warp to the monitor above</summary>
+      <description>Keybinding to move the pointer and focus to the neighbouring monitor above</description>
+    </key>
+
+    <key name="mmw-warp-to-adjacent-down" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Warp to the monitor below</summary>
+      <description>Keybinding to move the pointer and focus to the neighbouring monitor below</description>
+    </key>
+
+    <!-- Relative monitor navigation: move focused window to the neighbour's workspace -->
+    <key name="mmw-move-window-to-adjacent-left" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Move window to the workspace on the monitor left</summary>
+      <description>Keybinding to move the focused window to the workspace displayed on the neighbouring monitor to the left</description>
+    </key>
+
+    <key name="mmw-move-window-to-adjacent-right" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Move window to the workspace on the monitor right</summary>
+      <description>Keybinding to move the focused window to the workspace displayed on the neighbouring monitor to the right</description>
+    </key>
+
+    <key name="mmw-move-window-to-adjacent-up" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Move window to the workspace on the monitor above</summary>
+      <description>Keybinding to move the focused window to the workspace displayed on the neighbouring monitor above</description>
+    </key>
+
+    <key name="mmw-move-window-to-adjacent-down" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Move window to the workspace on the monitor below</summary>
+      <description>Keybinding to move the focused window to the workspace displayed on the neighbouring monitor below</description>
     </key>
 
     <!-- Window highlight settings -->

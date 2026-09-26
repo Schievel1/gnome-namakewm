@@ -172,6 +172,11 @@ class ShortcutRow extends Adw.ActionRow {
         for (let i = 0; i < 8; i++) {
             extensionKeys.push(`mmw-warp-to-monitor-${i}`);
         }
+        // Add relative monitor navigation keys
+        for (const direction of ['left', 'right', 'up', 'down']) {
+            extensionKeys.push(`mmw-warp-to-adjacent-${direction}`);
+            extensionKeys.push(`mmw-move-window-to-adjacent-${direction}`);
+        }
 
         for (const key of extensionKeys) {
             if (key === this._key) continue;  // Skip self
@@ -782,6 +787,39 @@ export default class MultiMonitorsWorkspacePreferences extends ExtensionPreferen
                 `Warp pointer to center of monitor ${i}`
             );
             warpGroup.add(row);
+        }
+
+        // Relative navigation: warp pointer and focus to the neighbouring monitor
+        const adjacentWarpGroup = new Adw.PreferencesGroup({
+            title: 'Warp to Adjacent Monitor',
+            description: 'Move pointer and focus to the neighbouring monitor in a direction',
+        });
+        page.add(adjacentWarpGroup);
+
+        const DIRECTION_LABELS = { left: 'Left', right: 'Right', up: 'Up', down: 'Down' };
+        for (const [direction, label] of Object.entries(DIRECTION_LABELS)) {
+            adjacentWarpGroup.add(new ShortcutRow(
+                settings,
+                `mmw-warp-to-adjacent-${direction}`,
+                `Monitor ${label}`,
+                `Move pointer and focus to the monitor to the ${direction}`
+            ));
+        }
+
+        // Relative navigation: move the focused window to the neighbour's workspace
+        const adjacentMoveGroup = new Adw.PreferencesGroup({
+            title: 'Move Window to Adjacent Monitor',
+            description: 'Move the focused window to the workspace shown on the neighbouring monitor',
+        });
+        page.add(adjacentMoveGroup);
+
+        for (const [direction, label] of Object.entries(DIRECTION_LABELS)) {
+            adjacentMoveGroup.add(new ShortcutRow(
+                settings,
+                `mmw-move-window-to-adjacent-${direction}`,
+                `Window to ${label}`,
+                `Move focused window to the workspace on the monitor to the ${direction}`
+            ));
         }
 
         // Window Highlight group

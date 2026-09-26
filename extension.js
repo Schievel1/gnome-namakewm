@@ -28,6 +28,9 @@ const DEBUG_LOG_PATH = '/tmp/mmw-debug.log';
 const OFFSCREEN_X = -20000;
 const OFFSCREEN_Y = -20000;
 
+// Directions for relative (neighbouring) monitor navigation
+const ADJACENT_DIRECTIONS = ['left', 'right', 'up', 'down'];
+
 export default class MultiMonitorsWorkspaceExtension extends Extension {
     _settings = null;
     _wmSettings = null;
@@ -62,6 +65,14 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
     // Flag to distinguish internal vs external workspace changes
     _isInternalSwitch = false;
+
+    // Suppresses the "focus is on another monitor than the pointer" guard in
+    // _onFocusWindowChanged. Set while we deliberately jump to a neighbouring
+    // monitor: the pointer warp is not visible to global.get_pointer() yet
+    // when the focus notification arrives, so the guard would pull the focus
+    // straight back and cancel the jump.
+    _suppressFocusMonitorGuard = false;
+    _suppressFocusGuardTimeoutId = null;
 
     // Workspace indicator
     _indicatorManager = null;
@@ -558,7 +569,12 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
                 Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
                 () => {
-                    this._warpPointerToMonitor(monitorSortIndex);
+                    this._beginIntentionalMonitorJump();
+                    try {
+                        this._warpPointerToMonitor(monitorSortIndex);
+                    } catch (e) {
+                        this._debugLog(`EXCEPTION in _warpPointerToMonitor(${monitorSortIndex}): ${e.message}`);
+                    }
                     // Show popup banner
                     if (this._popupBanner) {
                         const wsIndex = this._monitorWorkspaceMap.get(monitorSortIndex) ?? 0;
@@ -566,6 +582,41 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                     }
                 }
             );
+        }
+
+        // Register relative monitor navigation keybindings
+        for (const direction of ADJACENT_DIRECTIONS) {
+            const warpKeyName = `mmw-warp-to-adjacent-${direction}`;
+            const warpAction = Main.wm.addKeybinding(
+                warpKeyName,
+                this._settings,
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+                Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+                () => {
+                    const target = this._warpToAdjacentMonitor(direction);
+                    if (target === -1) return;
+                    // Show popup banner for the monitor we ended up on. Use the
+                    // index the handler resolved rather than asking the pointer,
+                    // which may not have caught up with the warp yet.
+                    if (this._popupBanner) {
+                        const wsIndex = this._monitorWorkspaceMap.get(target) ?? 0;
+                        this._popupBanner.show(target, wsIndex);
+                    }
+                }
+            );
+            this._logKeybindingGrab(warpKeyName, warpAction);
+
+            const moveKeyName = `mmw-move-window-to-adjacent-${direction}`;
+            const moveAction = Main.wm.addKeybinding(
+                moveKeyName,
+                this._settings,
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+                Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+                () => {
+                    this._moveWindowToAdjacentMonitor(direction);
+                }
+            );
+            this._logKeybindingGrab(moveKeyName, moveAction);
         }
 
         // Register cycle focus keybindings
@@ -613,6 +664,28 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         console.log('[MultiMonitorsWorkspace] Keybindings registered');
     }
 
+    // Main.wm.addKeybinding() returns Meta.KeyBindingAction.NONE when the
+    // accelerator could not be grabbed - usually because another component
+    // already owns that key combination. Log it, otherwise such a keybinding
+    // silently never fires.
+    _logKeybindingGrab(keyName, action) {
+        let accels = [];
+        try {
+            accels = this._settings.get_strv(keyName);
+        } catch (e) {
+            accels = ['<schema error>'];
+        }
+
+        if (accels.length === 0)
+            return;
+
+        if (action === Meta.KeyBindingAction.NONE) {
+            this._debugLog(`KEYBINDING NOT GRABBED: ${keyName} = ${accels.join(', ')} -- already taken by another component`);
+        } else {
+            this._debugLog(`keybinding ok: ${keyName} = ${accels.join(', ')}`);
+        }
+    }
+
     _unregisterKeybindings() {
         for (let i = 0; i <= 9; i++) {
             Main.wm.removeKeybinding(`mmw-switch-ws-${i}`);
@@ -620,6 +693,10 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         }
         for (let i = 0; i < 8; i++) {
             Main.wm.removeKeybinding(`mmw-warp-to-monitor-${i}`);
+        }
+        for (const direction of ADJACENT_DIRECTIONS) {
+            Main.wm.removeKeybinding(`mmw-warp-to-adjacent-${direction}`);
+            Main.wm.removeKeybinding(`mmw-move-window-to-adjacent-${direction}`);
         }
         Main.wm.removeKeybinding('mmw-cycle-focus-forward');
         Main.wm.removeKeybinding('mmw-cycle-focus-backward');
@@ -754,7 +831,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         // Wait for state changes to take effect, then swap positions
         this._addManagedTimeout(50, () => {
-            if (!focusedWindow.is_alive() || !targetWindow.is_alive()) {
+            if (!this._isWindowAlive(focusedWindow) || !this._isWindowAlive(targetWindow)) {
                 return GLib.SOURCE_REMOVE;
             }
 
@@ -771,7 +848,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
             // Restore states (swapped: focused gets target's state, target gets focused's state)
             this._addManagedTimeout(50, () => {
-                if (!focusedWindow.is_alive() || !targetWindow.is_alive()) {
+                if (!this._isWindowAlive(focusedWindow) || !this._isWindowAlive(targetWindow)) {
                     return GLib.SOURCE_REMOVE;
                 }
 
@@ -782,7 +859,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 if (currentFullscreen) targetWindow.make_fullscreen();
 
                 // Re-focus the originally focused window to prevent "ready" notification
-                if (focusedWindow.is_alive()) {
+                if (this._isWindowAlive(focusedWindow)) {
                     focusedWindow.focus(global.get_current_time());
                 }
 
@@ -860,22 +937,33 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         if (lastWindowId) {
             // Try to find the saved window
             const window = this._findWindowById(lastWindowId);
-            if (window && window.is_alive()) {
+            if (this._isWindowAlive(window)) {
                 // Verify the window is on the correct monitor
                 const windowMonitor = this._getWindowMonitor(window);
-                // Verify the window is visible on the current workspace
-                const activeWs = global.workspace_manager.get_active_workspace();
-                const isOnActiveWs = window.located_on_workspace(activeWs);
+                // Only the primary monitor tracks the real global workspace. In
+                // workspaces-only-on-primary mode the windows on secondary
+                // monitors are sticky (WS = -1), so asking
+                // window.located_on_workspace(activeWs) reports false for them
+                // and used to wipe the saved record on every jump.
+                const primaryMonitor = global.display.get_primary_monitor();
+                let isVisibleHere;
+                if (monitorIndex === primaryMonitor) {
+                    const activeWs = global.workspace_manager.get_active_workspace();
+                    isVisibleHere = window.located_on_workspace(activeWs);
+                } else {
+                    // On a secondary monitor every non-hidden window is visible
+                    isVisibleHere = !window.is_hidden();
+                }
 
-                if (windowMonitor === monitorIndex && isOnActiveWs) {
+                if (windowMonitor === monitorIndex && isVisibleHere) {
                     // Focus the window and warp to its center
                     const rect = window.get_frame_rect();
                     targetX = Math.floor(rect.x + rect.width / 2);
                     targetY = Math.floor(rect.y + rect.height / 2);
                     focusedWindow = window;
                     this._debugLog(`Restored focus to last window: "${window.get_title()}" on WS${wsIndex}`);
-                } else if (!isOnActiveWs) {
-                    this._debugLog(`Window "${window.get_title()}" not on active WS, clearing record`);
+                } else if (!isVisibleHere) {
+                    this._debugLog(`Window "${window.get_title()}" not visible here, clearing record`);
                     this._lastWindowPerWorkspace.delete(wsIndex);
                 }
             }
@@ -888,19 +976,81 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         }
 
         // Warp pointer
+        this._debugLog(`    warp_pointer(${targetX},${targetY})`);
         seat.warp_pointer(targetX, targetY);
 
         // Focus the window (or find one at position)
+        this._debugLog(`    focusing: ${focusedWindow ? `"${focusedWindow.get_title?.()}"` : '<by position>'}`);
         if (focusedWindow) {
             focusedWindow.focus(global.get_current_time());
         } else {
             this._focusWindowAtPosition(targetX, targetY, monitorIndex);
         }
+        this._debugLog(`    focus call returned`);
 
         // Update indicator highlight
         if (this._indicatorManager) {
             this._indicatorManager.updateHighlight();
         }
+    }
+
+    // Describe pointer + focus so we can see whether a jump actually happened,
+    // not merely that the target was computed.
+    _describeFocusState(label) {
+        const [px, py] = global.get_pointer();
+        const monAtPointer = this._getMonitorAtPointer();
+        const focused = global.display.get_focus_window();
+        let focusDesc = 'none';
+        if (focused) {
+            const fmon = this._getWindowMonitor(focused);
+            const title = (focused.get_title?.() ?? '?').slice(0, 28);
+            focusDesc = `"${title}" on M${fmon}`;
+        }
+        this._debugLog(`  ${label}: pointer=(${px},${py}) on M${monAtPointer} | focus=${focusDesc} | stageFocus=${global.stage.get_key_focus() ? 'actor' : 'null'}`);
+    }
+
+    // Keep the "focus is on another monitor" guard out of the way for a moment.
+    // GObject notify::focus-window normally fires synchronously from focus(),
+    // but the pointer warp and any queued focus change can land a few
+    // milliseconds later, so we clear the flag on a short timer rather than
+    // right after the call returns.
+    _beginIntentionalMonitorJump() {
+        this._suppressFocusMonitorGuard = true;
+
+        if (this._suppressFocusGuardTimeoutId) {
+            this._cancelManagedTimeout(this._suppressFocusGuardTimeoutId);
+        }
+        this._suppressFocusGuardTimeoutId = this._addManagedTimeout(300, () => {
+            this._suppressFocusGuardTimeoutId = null;
+            this._suppressFocusMonitorGuard = false;
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Warp pointer and focus to the neighbouring monitor in a direction.
+    // Thin wrapper: the actual work is done by _warpPointerToMonitor().
+    // Returns the monitor we landed on, or -1 when there was no neighbour, so
+    // the caller does not have to ask the pointer where it ended up.
+    _warpToAdjacentMonitor(direction) {
+        const fromMonitor = this._getMonitorAtPointer();
+        const targetMonitor = this._getAdjacentMonitor(fromMonitor, direction);
+
+        if (targetMonitor === -1) {
+            this._debugLog(`No monitor ${direction} of M${fromMonitor}, ignoring`);
+            return -1;
+        }
+
+        this._describeFocusState(`BEFORE ${direction} M${fromMonitor}->M${targetMonitor}`);
+        this._debugLog(`Warp to adjacent monitor: M${fromMonitor} --${direction}--> M${targetMonitor}`);
+        this._beginIntentionalMonitorJump();
+        try {
+            this._warpPointerToMonitor(targetMonitor);
+        } catch (e) {
+            this._debugLog(`EXCEPTION in _warpPointerToMonitor: ${e.message}`);
+            this._debugLog(`STACK: ${e.stack}`);
+        }
+        this._describeFocusState(`AFTER  ${direction} M${fromMonitor}->M${targetMonitor}`);
+        return targetMonitor;
     }
 
     // Focus window at position - optimized version that only checks windows on specific monitor
@@ -960,7 +1110,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         if (lastWindowId) {
             // Try to find the saved window
             const window = this._findWindowById(lastWindowId);
-            if (window && window.is_alive()) {
+            if (this._isWindowAlive(window)) {
                 // Verify the window is on the correct monitor
                 const windowMonitor = this._getWindowMonitor(window);
                 // Verify the window is visible on the current workspace
@@ -1116,6 +1266,99 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         this._debugLog(`========== END MOVE WINDOW ==========\n`);
     }
 
+    // Move the focused window to the workspace displayed on the neighbouring
+    // monitor in a direction. The window is physically relocated to that
+    // monitor (keeping its relative position and size) and assigned the
+    // workspace that monitor is showing.
+    //
+    // This deliberately does not reuse _moveWindowToWorkspace(): that one
+    // always places the window at *primary* coordinates, which would leave the
+    // window on a different monitor than the one we just navigated to.
+    _moveWindowToAdjacentMonitor(direction) {
+        const focusedWindow = global.display.get_focus_window();
+        if (!focusedWindow) {
+            console.log('[MultiMonitorsWorkspace] No focused window to move');
+            return;
+        }
+
+        if (focusedWindow.get_window_type() !== Meta.WindowType.NORMAL) {
+            console.log('[MultiMonitorsWorkspace] Cannot move non-normal window');
+            return;
+        }
+
+        const fromMonitor = this._getMonitorAtPointer();
+        const targetMonitor = this._getAdjacentMonitor(fromMonitor, direction);
+        if (targetMonitor === -1) {
+            this._debugLog(`No monitor ${direction} of M${fromMonitor}, ignoring`);
+            return;
+        }
+
+        const title = focusedWindow.get_title?.() ?? 'unknown';
+        const fromGeo = global.display.get_monitor_geometry(fromMonitor);
+        const targetGeo = global.display.get_monitor_geometry(targetMonitor);
+        const targetWs = this._monitorWorkspaceMap.get(targetMonitor) ?? 0;
+        const primaryMonitor = global.display.get_primary_monitor();
+        const currentGlobalWs = global.workspace_manager.get_active_workspace();
+
+        this._debugLog(`\n========== MOVE WINDOW TO ADJACENT MONITOR ==========`);
+        this._debugLog(`Window: "${title}" M${fromMonitor} --${direction}--> M${targetMonitor} (WS${targetWs})`);
+
+        const rect = focusedWindow.get_frame_rect();
+        const relX = rect.x - fromGeo.x;
+        const relY = rect.y - fromGeo.y;
+        const width = rect.width;
+        const height = rect.height;
+
+        // Remember the relative position so a later workspace switch can put
+        // the window back where the user expects it.
+        const windowId = this._getWindowId(focusedWindow);
+        this._savedWindowPositions.set(windowId, { relX, relY, wsIndex: targetWs });
+
+        const newX = targetGeo.x + relX;
+        const newY = targetGeo.y + relY;
+        focusedWindow.move_resize_frame(false, newX, newY, width, height);
+
+        // Explicit monitor assignment - without this maximised windows end up
+        // sized for the wrong monitor.
+        focusedWindow.move_to_monitor(targetMonitor);
+
+        // Re-apply size after a short delay (GNOME may reset it)
+        const w = focusedWindow, finalX = newX, finalY = newY, finalW = width, finalH = height;
+        this._addManagedTimeout(50, () => {
+            if (this._isWindowAlive(w)) {
+                w.move_resize_frame(false, finalX, finalY, finalW, finalH);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+
+        // Secondary monitor windows are sticky (workspaces-only-on-primary), so
+        // there we assign the current global workspace; on primary we assign
+        // the workspace the monitor is actually showing.
+        if (targetMonitor === primaryMonitor) {
+            const targetWsObj = global.workspace_manager.get_workspace_by_index(targetWs);
+            if (targetWsObj) {
+                focusedWindow.change_workspace(targetWsObj);
+            }
+        } else if (currentGlobalWs) {
+            focusedWindow.change_workspace(currentGlobalWs);
+        }
+
+        // Follow the window with the pointer, otherwise focus and pointer would
+        // sit on different monitors.
+        const seat = Clutter.get_default_backend().get_default_seat();
+        seat.warp_pointer(Math.floor(newX + width / 2), Math.floor(newY + height / 2));
+
+        if (this._indicatorManager) {
+            this._indicatorManager.updateHighlight();
+        }
+        if (this._popupBanner) {
+            this._popupBanner.show(targetMonitor, targetWs);
+        }
+
+        this._debugLog(`Moved "${title}" to M${targetMonitor} (WS${targetWs}) at (${newX},${newY}) ${width}x${height}`);
+        this._debugLog(`========== END MOVE WINDOW TO ADJACENT MONITOR ==========\n`);
+    }
+
     _connectSignals() {
         const monitorManager = global.backend.get_monitor_manager();
         const id1 = monitorManager.connect('monitors-changed', () => {
@@ -1252,15 +1495,24 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
                 // If focus moved to a different monitor than pointer, correct it
                 if (focusWindowMonitor !== -1 && focusWindowMonitor !== pointerMonitor) {
-                    this._debugLog(`Focus moved to M${focusWindowMonitor} but pointer on M${pointerMonitor}, correcting...`);
+                    // ...unless we are in the middle of a deliberate jump to a
+                    // neighbouring monitor. The pointer warp we just requested is
+                    // not reflected by global.get_pointer() at this point, so the
+                    // comparison above is stale and "correcting" would undo the
+                    // jump by pulling focus back onto the monitor we came from.
+                    if (this._suppressFocusMonitorGuard) {
+                        this._debugLog(`Focus on M${focusWindowMonitor} vs pointer M${pointerMonitor}: intentional monitor jump, not correcting`);
+                    } else {
+                        this._debugLog(`Focus moved to M${focusWindowMonitor} but pointer on M${pointerMonitor}, correcting...`);
 
-                    // Skip if this window is pending placement
-                    const windowId = this._getWindowId(focusWindow);
-                    if (!this._windowsPendingPlacement.has(windowId)) {
-                        // Try to focus a window on the pointer's monitor
-                        const [pointerX, pointerY] = global.get_pointer();
-                        this._focusWindowAtPosition(pointerX, pointerY, pointerMonitor);
-                        return;
+                        // Skip if this window is pending placement
+                        const windowId = this._getWindowId(focusWindow);
+                        if (!this._windowsPendingPlacement.has(windowId)) {
+                            // Try to focus a window on the pointer's monitor
+                            const [pointerX, pointerY] = global.get_pointer();
+                            this._focusWindowAtPosition(pointerX, pointerY, pointerMonitor);
+                            return;
+                        }
                     }
                 }
             }
@@ -1427,7 +1679,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
     // Move window to a specific monitor (used for new window placement)
     _moveWindowToMonitor(window, targetMonitor, windowId = null) {
-        if (!window || !window.is_alive()) {
+        if (!this._isWindowAlive(window)) {
             if (windowId) this._windowsPendingPlacement.delete(windowId);
             return;
         }
@@ -1537,7 +1789,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         }
 
         // Focus the newly created window
-        if (window && window.is_alive()) {
+        if (this._isWindowAlive(window)) {
             const title = window.get_title?.() ?? 'unknown';
             window.activate(global.get_current_time());
             this._debugLog(`NEW WINDOW: Focused "${title}"`);
@@ -1603,7 +1855,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 // Delayed re-apply for stability
                 const w = window, x = newX, y = newY, width = rect.width, height = rect.height;
                 this._addManagedTimeout(50, () => {
-                    if (w.is_alive()) {
+                    if (this._isWindowAlive(w)) {
                         w.move_resize_frame(false, x, y, width, height);
                     }
                     return GLib.SOURCE_REMOVE;
@@ -1940,7 +2192,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             // Re-apply size after a short delay (GNOME may reset size when untiling)
             const w = window, finalW = width, finalH = height, finalX = newX, finalY = newY;
             this._addManagedTimeout(50, () => {
-                if (w.is_alive()) {
+                if (this._isWindowAlive(w)) {
                     w.move_resize_frame(false, finalX, finalY, finalW, finalH);
                 }
                 return GLib.SOURCE_REMOVE;
@@ -1991,7 +2243,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             // Re-apply size after a short delay (GNOME may reset size when untiling)
             const w = window, finalW = width, finalH = height, finalX = newX, finalY = newY;
             this._addManagedTimeout(50, () => {
-                if (w.is_alive()) {
+                if (this._isWindowAlive(w)) {
                     w.move_resize_frame(false, finalX, finalY, finalW, finalH);
                 }
                 return GLib.SOURCE_REMOVE;
@@ -2021,6 +2273,22 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             if (w === ws) return m;
         }
         return null;
+    }
+
+    // Is this Meta.Window still usable?
+    //
+    // There is no Meta.Window.is_alive() *method*. "is-alive" is a read-only
+    // GObject *property* of type boolean, so calling it throws
+    // "window.is_alive is not a function". The only real method is
+    // check_alive(timestamp), which returns a boolean and additionally reaps
+    // the window if it has died since the last check.
+    _isWindowAlive(window) {
+        if (!window) return false;
+        try {
+            return window.check_alive(global.get_current_time()) === true;
+        } catch (e) {
+            return false;
+        }
     }
 
     // Get the monitor index where the window is currently located (by coordinates)
@@ -2056,6 +2324,81 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         this._debugLog(`WARNING: Pointer (${pointerX},${pointerY}) not on any monitor, using primary`);
         return global.display.get_primary_monitor();
+    }
+
+    // Find the neighbouring monitor of fromMonitor in the given direction.
+    // Returns the monitor index, or -1 when there is no neighbour.
+    //
+    // Compares monitor *centres* rather than raw x/y: monitors side by side
+    // often have different heights (1920x1080 next to 1280x1024), so their y
+    // origins differ and any grouping by geo.y would file them in different
+    // rows even though they sit next to each other.
+    //
+    // Ranking, in order:
+    //   1. must lie strictly on the correct side on the main axis
+    //   2. prefer monitors overlapping on the cross axis (directly beside)
+    //   3. otherwise the closest one on the main axis
+    _getAdjacentMonitor(fromMonitor, direction) {
+        const nMonitors = global.display.get_n_monitors();
+        if (nMonitors < 2) return -1;
+
+        const fromGeo = global.display.get_monitor_geometry(fromMonitor);
+        if (!fromGeo) return -1;
+        const fromCx = fromGeo.x + fromGeo.width / 2;
+        const fromCy = fromGeo.y + fromGeo.height / 2;
+
+        let best = -1;
+        let bestOverlaps = false;
+        let bestDist = 0;
+
+        for (let i = 0; i < nMonitors; i++) {
+            if (i === fromMonitor) continue;
+            const geo = global.display.get_monitor_geometry(i);
+            if (!geo) continue;
+
+            const cx = geo.x + geo.width / 2;
+            const cy = geo.y + geo.height / 2;
+
+            let forward, overlaps, dist;
+            switch (direction) {
+                case 'left':
+                    forward = cx < fromCx;
+                    overlaps = fromGeo.y < geo.y + geo.height && geo.y < fromGeo.y + fromGeo.height;
+                    dist = fromCx - cx;
+                    break;
+                case 'right':
+                    forward = cx > fromCx;
+                    overlaps = fromGeo.y < geo.y + geo.height && geo.y < fromGeo.y + fromGeo.height;
+                    dist = cx - fromCx;
+                    break;
+                case 'up':
+                    forward = cy < fromCy;
+                    overlaps = fromGeo.x < geo.x + geo.width && geo.x < fromGeo.x + fromGeo.width;
+                    dist = fromCy - cy;
+                    break;
+                case 'down':
+                    forward = cy > fromCy;
+                    overlaps = fromGeo.x < geo.x + geo.width && geo.x < fromGeo.x + fromGeo.width;
+                    dist = cy - fromCy;
+                    break;
+                default:
+                    this._debugLog(`Unknown direction: ${direction}`);
+                    return -1;
+            }
+
+            if (!forward) continue;
+            // `dist` is always positive for accepted candidates
+            if (best === -1 ||
+                (overlaps && !bestOverlaps) ||
+                (overlaps === bestOverlaps && dist < bestDist)) {
+                best = i;
+                bestOverlaps = overlaps;
+                bestDist = dist;
+            }
+        }
+
+        this._debugLog(`Adjacent monitor ${direction} of M${fromMonitor}: ${best}`);
+        return best;
     }
 
     // Get all normal windows currently on a specific monitor (by coordinate)
@@ -2296,7 +2639,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             // Re-apply size after a short delay (GNOME may reset size when untiling)
             const w = window, finalW = width, finalH = height, finalX = newX, finalY = newY;
             this._addManagedTimeout(50, () => {
-                if (w.is_alive()) {
+                if (this._isWindowAlive(w)) {
                     w.move_resize_frame(false, finalX, finalY, finalW, finalH);
                 }
                 return GLib.SOURCE_REMOVE;
@@ -2329,7 +2672,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             // Re-apply size after a short delay (GNOME may reset size when untiling)
             const w = window, finalW = width, finalH = height, finalX = newX, finalY = newY;
             this._addManagedTimeout(50, () => {
-                if (w.is_alive()) {
+                if (this._isWindowAlive(w)) {
                     w.move_resize_frame(false, finalX, finalY, finalW, finalH);
                 }
                 return GLib.SOURCE_REMOVE;
@@ -2497,6 +2840,16 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
     _initDebugLog() {
         try {
+            // Release the previous stream before truncating, otherwise the old
+            // append handle would keep writing at its stale offset.
+            if (this._debugLogStream) {
+                try {
+                    this._debugLogStream.close(null);
+                } catch (e) {
+                    // already closed
+                }
+                this._debugLogStream = null;
+            }
             // Clear previous log file
             GLib.file_set_contents(DEBUG_LOG_PATH, '');
             this._debugLog(`Debug log initialized at ${new Date().toISOString()}`);
@@ -2510,12 +2863,20 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         const timestamp = new Date().toISOString().slice(11, 23);
         const line = `[${timestamp}] ${message}\n`;
+
+        // One long-lived append stream for the whole session. Opening a fresh
+        // stream per line made back-to-back writes race each other on the file
+        // offset and silently drop roughly every other line, which made the log
+        // useless for diagnosing before/after behaviour.
         try {
-            const file = Gio.File.new_for_path(DEBUG_LOG_PATH);
-            const stream = file.append_to(Gio.FileCreateFlags.NONE, null);
-            stream.write_all(line, null);
-            stream.close(null);
+            if (!this._debugLogStream) {
+                const file = Gio.File.new_for_path(DEBUG_LOG_PATH);
+                this._debugLogStream = file.append_to(Gio.FileCreateFlags.NONE, null);
+            }
+            this._debugLogStream.write_all(line, null);
         } catch (e) {
+            // Drop the stream so the next call reopens it
+            this._debugLogStream = null;
             console.error('[MultiMonitorsWorkspace] Debug log write failed:', e);
         }
         // Also output to journal
