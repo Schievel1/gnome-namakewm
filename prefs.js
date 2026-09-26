@@ -10,6 +10,8 @@ import Pango from 'gi://Pango';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+import * as BingWallpaper from './lib/bingWallpaper.js';
+
 // System keybinding schemas to check for conflicts
 const SYSTEM_KEYBINDING_SCHEMAS = [
     'org.gnome.desktop.wm.keybindings',
@@ -310,17 +312,31 @@ class WallpaperGroupRow extends Adw.ActionRow {
                 this._workspaces = groups[this._groupIndex].workspaces || [];
                 this._scale = groups[this._groupIndex].scale !== false; // default true
                 this._tile = groups[this._groupIndex].tile === true; // default false
+                // A numeric "bing" selects the Bing wallpaper of the day,
+                // counted back from today. Absent means a plain image file.
+                if (groups[this._groupIndex].bing !== undefined &&
+                    groups[this._groupIndex].bing !== null) {
+                    this._source = 'bing';
+                    this._bing = groups[this._groupIndex].bing;
+                } else {
+                    this._source = 'file';
+                    this._bing = 0;
+                }
             } else {
                 this._path = '';
                 this._workspaces = [];
                 this._scale = true;
                 this._tile = false;
+                this._source = 'file';
+                this._bing = 0;
             }
         } catch (e) {
             this._path = '';
             this._workspaces = [];
             this._scale = true;
             this._tile = false;
+            this._source = 'file';
+            this._bing = 0;
         }
     }
 
@@ -334,12 +350,19 @@ class WallpaperGroupRow extends Adw.ActionRow {
                 groups.push({ path: '', workspaces: [], scale: true, tile: false });
             }
 
-            groups[this._groupIndex] = {
+            const group = {
                 path: this._path,
                 workspaces: this._workspaces,
                 scale: this._scale,
                 tile: this._tile,
             };
+            // Only persist "bing" for Bing groups, so switching a group back to
+            // a plain file leaves no stale field behind.
+            if (this._source === 'bing') {
+                group.bing = this._bing;
+                group.path = '';
+            }
+            groups[this._groupIndex] = group;
 
             this._settings.set_string('wallpaper-groups', JSON.stringify(groups));
             this._onUpdate();
@@ -350,18 +373,31 @@ class WallpaperGroupRow extends Adw.ActionRow {
 
     _updateSubtitle() {
         const wsDisplay = this._workspaces.map(ws => ws === 9 ? 0 : ws + 1).join(', ');
-        const filename = this._path ? this._path.split('/').pop() : 'No image';
-        this.set_subtitle(`WS: ${wsDisplay || 'None'} | ${filename}`);
+        let what;
+        if (this._source === 'bing') {
+            what = `Bing: ${BingWallpaper.dayLabel(this._bing)}`;
+        } else {
+            what = this._path ? this._path.split('/').pop() : 'No image';
+        }
+        this.set_subtitle(`WS: ${wsDisplay || 'None'} | ${what}`);
     }
 
     _openSettingsDialog() {
         const parentWindow = this.get_root();
 
         // Use Adw.Dialog for GNOME 46+ (works regardless of attach-modal-dialogs setting)
+        //
+        // Kept narrow on purpose. The preferences window is itself a popup, and a
+        // dialog wider than that window gets clipped, which would put the right
+        // hand side of every row - including whatever a row opens - out of reach.
+        // The workspace buttons wrap onto two rows so the content itself stays
+        // narrow enough for this width to actually take effect.
+        // The height is left to the content instead of being pinned, so the dialog
+        // cannot outgrow a short window either.
         const dialog = new Adw.Dialog({
             title: `Wallpaper Group ${this._groupIndex + 1}`,
-            content_width: 400,
-            content_height: 380,
+            content_width: 300,
+            content_height: -1,
         });
 
         const mainBox = new Gtk.Box({
@@ -390,35 +426,45 @@ class WallpaperGroupRow extends Adw.ActionRow {
         });
         wsSection.append(wsTitle);
 
-        const wsBox = new Gtk.Box({
-            orientation: Gtk.Orientation.HORIZONTAL,
+        // Two rows of five. A single row of ten toggle buttons forces a minimum
+        // width of roughly 390px, which is wider than the preferences window and
+        // got the dialog clipped until it was dragged smaller by hand.
+        const wsRows = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
             spacing: 4,
-            homogeneous: true,
         });
 
-        const wsButtons = [];
-        for (let i = 0; i < 10; i++) {
-            const wsNum = i === 9 ? 0 : i + 1;
-            const btn = new Gtk.ToggleButton({
-                label: String(wsNum),
+        for (let start = 0; start < 10; start += 5) {
+            const wsRow = new Gtk.Box({
+                orientation: Gtk.Orientation.HORIZONTAL,
+                spacing: 4,
+                homogeneous: true,
             });
-            btn.set_active(this._workspaces.includes(i));
-            btn.connect('toggled', () => {
-                if (btn.get_active()) {
-                    if (!this._workspaces.includes(i)) {
-                        this._workspaces.push(i);
-                        this._workspaces.sort((a, b) => a - b);
+
+            for (let i = start; i < start + 5; i++) {
+                const wsNum = i === 9 ? 0 : i + 1;
+                const btn = new Gtk.ToggleButton({
+                    label: String(wsNum),
+                });
+                btn.set_active(this._workspaces.includes(i));
+                btn.connect('toggled', () => {
+                    if (btn.get_active()) {
+                        if (!this._workspaces.includes(i)) {
+                            this._workspaces.push(i);
+                            this._workspaces.sort((a, b) => a - b);
+                        }
+                    } else {
+                        this._workspaces = this._workspaces.filter(ws => ws !== i);
                     }
-                } else {
-                    this._workspaces = this._workspaces.filter(ws => ws !== i);
-                }
-                this._saveGroupData();
-                this._updateSubtitle();
-            });
-            wsButtons.push(btn);
-            wsBox.append(btn);
+                    this._saveGroupData();
+                    this._updateSubtitle();
+                });
+                wsRow.append(btn);
+            }
+
+            wsRows.append(wsRow);
         }
-        wsSection.append(wsBox);
+        wsSection.append(wsRows);
         wsFrame.set_child(wsSection);
         mainBox.append(wsFrame);
 
@@ -439,7 +485,130 @@ class WallpaperGroupRow extends Adw.ActionRow {
         });
         imageSection.append(imageTitle);
 
-        const imageBox = new Gtk.Box({
+        const bingAvailable = BingWallpaper.isAvailable();
+
+        // --- Source picker: plain file or Bing wallpaper of the day ---
+        // Bing is only offered when that extension has actually downloaded
+        // something, so the option never leads to an empty workspace.
+        //
+        // Toggle buttons rather than an Adw.ComboRow on purpose. A ComboRow is a
+        // GtkPopover, and the preferences window is itself a popup, so the row's
+        // popover ended up nested inside another popup and never came up. The
+        // preferences get a plain window in a normal session, where the same code
+        // looks fine, which is why this only ever showed up here.
+        const sourceBox = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 0,
+            homogeneous: true,
+        });
+        const fileSourceBtn = new Gtk.ToggleButton({
+            label: 'Image File',
+            active: !(bingAvailable && this._source === 'bing'),
+        });
+        const bingSourceBtn = new Gtk.ToggleButton({
+            label: 'Bing of the Day',
+            active: bingAvailable && this._source === 'bing',
+            sensitive: bingAvailable,
+        });
+        sourceBox.append(fileSourceBtn);
+        sourceBox.append(bingSourceBtn);
+        imageSection.append(sourceBox);
+        if (!bingAvailable) {
+            imageSection.append(new Gtk.Label({
+                label: 'Bing unavailable - no wallpapers found in the download folder',
+                xalign: 0,
+                wrap: true,
+                css_classes: ['dim-label'],
+            }));
+        }
+
+        const applySource = () => {
+            // Toggle buttons report "activate" for the one clicked and "activate"
+            // again for the one released, so the explicit active states are
+            // read instead of trusting the signal.
+            const wantBing = bingSourceBtn.get_active();
+            fileSourceBtn.set_active(!wantBing);
+            bingSourceBtn.set_active(wantBing);
+            this._source = wantBing ? 'bing' : 'file';
+            this._saveGroupData();
+            this._updateSubtitle();
+            updateBingVisibility();
+        };
+        fileSourceBtn.connect('toggled', applySource);
+        bingSourceBtn.connect('toggled', applySource);
+
+        // --- Bing day picker ---
+        // A spin button, again for the same reason: a numeric choice needs no
+        // popover, and it also makes an offset that has no download yet visible
+        // instead of hiding it.
+        let bingDayRow = null;
+        let bingInfo = null;
+        if (bingAvailable) {
+            const maxOffset = BingWallpaper.maxBingOffset();
+
+            bingDayRow = new Adw.SpinRow({
+                title: 'Days ago',
+                subtitle: '0 is today, 1 is yesterday',
+                adjustment: new Gtk.Adjustment({
+                    lower: 0,
+                    upper: maxOffset,
+                    step_increment: 1,
+                    page_increment: 1,
+                    value: this._bing,
+                }),
+            });
+
+            bingInfo = new Gtk.Label({
+                label: '',
+                ellipsize: Pango.EllipsizeMode.END,
+                xalign: 0,
+                wrap: true,
+                css_classes: ['dim-label'],
+            });
+            const refreshBingInfo = () => {
+                const offset = this._bing;
+                const resolved = BingWallpaper.resolveBingWallpaper(offset);
+                if (!resolved) {
+                    bingInfo.set_label(
+                        'No image downloaded for this day yet - it appears once BingWallpaper fetches it'
+                    );
+                } else if (resolved.exact) {
+                    bingInfo.set_label(`${BingWallpaper.dayLabel(offset)} - ${resolved.path.split('/').pop()}`);
+                } else {
+                    // The requested day has no download yet, so the newest older
+                    // image is used. Saying "today" while showing yesterday's image
+                    // is misleading, so name the image's real age instead.
+                    const age = resolved.ageDays ?? 1;
+                    bingInfo.set_label(
+                        `${BingWallpaper.dayLabel(offset)} has no image yet, using ` +
+                        `${BingWallpaper.dayLabel(age).toLowerCase()} - ${resolved.path.split('/').pop()}`);
+                }
+            };
+            refreshBingInfo();
+
+            bingDayRow.connect('notify::value', () => {
+                this._bing = Math.round(bingDayRow.get_value());
+                refreshBingInfo();
+                this._saveGroupData();
+                this._updateSubtitle();
+            });
+
+            imageSection.append(bingDayRow);
+            imageSection.append(bingInfo);
+        }
+
+        // Only one of the two sources' rows is ever useful at a time. Driven
+        // from one place so the file picker and the day picker cannot disagree
+        // about what is showing. fileRow does not exist yet at this point, so
+        // the first call happens further down once it has been built.
+        const updateBingVisibility = () => {
+            const isBing = bingAvailable && this._source === 'bing';
+            fileRow.visible = !isBing;
+            if (bingDayRow) bingDayRow.visible = isBing;
+            if (bingInfo) bingInfo.visible = isBing;
+        };
+
+        const fileRow = new Gtk.Box({
             orientation: Gtk.Orientation.HORIZONTAL,
             spacing: 8,
         });
@@ -470,10 +639,11 @@ class WallpaperGroupRow extends Adw.ActionRow {
             this._updateSubtitle();
         });
 
-        imageBox.append(imageLabel);
-        imageBox.append(chooseBtn);
-        imageBox.append(clearBtn);
-        imageSection.append(imageBox);
+        fileRow.append(imageLabel);
+        fileRow.append(chooseBtn);
+        fileRow.append(clearBtn);
+        imageSection.append(fileRow);
+        updateBingVisibility();
         imageFrame.set_child(imageSection);
         mainBox.append(imageFrame);
 
