@@ -148,7 +148,19 @@
       <description>When focus changes via keyboard (Alt+Tab, dock, etc.), move pointer to the center of the newly focused window</description>
     </key>
 
+    <!-- Window focus follows the mouse pointer -->
+    <key name="focus-follows-mouse" type="b">
+      <default>false</default>
+      <summary>Window focus follows the mouse</summary>
+      <description>When enabled, hovering a window focuses it, without having to click. Switches Mutter's own focus-mode between 'sloppy' and 'click'; the previous value is restored when the extension is disabled</description>
+    </key>
 
+    <!-- Mutter focus-mode value to put back when disabling -->
+    <key name="saved-focus-mode" type="s">
+      <default>''</default>
+      <summary>Previously saved Mutter focus mode</summary>
+      <description>Internal: the org.gnome.desktop.wm.preferences focus-mode value that was active before this extension changed it, so it can be restored on disable</description>
+    </key>
 
     <!-- Raise window on cycle focus -->
     <key name="raise-on-cycle-focus" type="b">

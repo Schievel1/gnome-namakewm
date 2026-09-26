@@ -18,6 +18,7 @@ import { WallpaperOverlayManager } from './lib/wallpaperOverlay.js';
 
 // System keybinding schema
 const WM_KEYBINDINGS_SCHEMA = 'org.gnome.desktop.wm.keybindings';
+const WM_PREFERENCES_SCHEMA = 'org.gnome.desktop.wm.preferences';
 const INTERFACE_SCHEMA = 'org.gnome.desktop.interface';
 const MUTTER_SCHEMA = 'org.gnome.mutter';
 
@@ -34,6 +35,7 @@ const ADJACENT_DIRECTIONS = ['left', 'right', 'up', 'down'];
 export default class MultiMonitorsWorkspaceExtension extends Extension {
     _settings = null;
     _wmSettings = null;
+    _wmPreferences = null;
     _interfaceSettings = null;
     _mutterSettings = null;
     _debugMode = false;
@@ -100,6 +102,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         this._settings = this.getSettings();
         this._wmSettings = new Gio.Settings({ schema_id: WM_KEYBINDINGS_SCHEMA });
+        this._wmPreferences = new Gio.Settings({ schema_id: WM_PREFERENCES_SCHEMA });
         this._interfaceSettings = new Gio.Settings({ schema_id: INTERFACE_SCHEMA });
         this._mutterSettings = new Gio.Settings({ schema_id: MUTTER_SCHEMA });
 
@@ -135,7 +138,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         this._updateWorkspaceKeybindingSettings();
         this._overrideSystemKeybindings();
-        this._initializeMapping();
+        this._applyFocusMode();
         this._initializeMapping();
         this._registerKeybindings();
         this._connectSignals();
@@ -189,6 +192,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         this._disconnectSignals();
         this._unregisterKeybindings();
         this._restoreSystemKeybindings();
+        this._restoreFocusMode();
         this._hideOsd();
 
         // Destroy workspace indicator
@@ -230,6 +234,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         // Note: Do NOT clear _lastWindowPerWorkspace - it's useful for focus restoration after unlock
         this._interfaceSettings = null;
         this._wmSettings = null;
+        this._wmPreferences = null;
         this._mutterSettings = null;
         this._settings = null;
 
@@ -404,6 +409,50 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             console.log('[MultiMonitorsWorkspace] System keybindings restored');
         } catch (e) {
             console.error('[MultiMonitorsWorkspace] Failed to restore keybindings:', e);
+        }
+    }
+
+    // Focus-follows-mouse is Mutter's own focus-mode. We only flip it between
+    // 'click' and 'sloppy' and remember the previous value so disable() can put
+    // it back - we should not leave a global GNOME setting changed behind us.
+    _applyFocusMode() {
+        if (!this._wmPreferences) return;
+
+        const wantFollow = this._settings.get_boolean('focus-follows-mouse');
+        const target = wantFollow ? 'sloppy' : 'click';
+
+        try {
+            const current = this._wmPreferences.get_string('focus-mode');
+
+            if (current === target) {
+                this._debugLog(`focus-mode already '${target}'`);
+                return;
+            }
+
+            // Remember what was there before the first change we made
+            if (this._settings.get_string('saved-focus-mode') === '') {
+                this._settings.set_string('saved-focus-mode', current);
+            }
+
+            this._wmPreferences.set_string('focus-mode', target);
+            console.log(`[MultiMonitorsWorkspace] focus-mode: ${current} -> ${target}`);
+        } catch (e) {
+            console.error('[MultiMonitorsWorkspace] Failed to set focus-mode:', e);
+        }
+    }
+
+    _restoreFocusMode() {
+        if (!this._wmPreferences) return;
+
+        const saved = this._settings.get_string('saved-focus-mode');
+        if (saved === '') return;
+
+        try {
+            this._wmPreferences.set_string('focus-mode', saved);
+            this._settings.set_string('saved-focus-mode', '');
+            console.log(`[MultiMonitorsWorkspace] focus-mode restored to '${saved}'`);
+        } catch (e) {
+            console.error('[MultiMonitorsWorkspace] Failed to restore focus-mode:', e);
         }
     }
 
@@ -1576,6 +1625,14 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             this._indicatorManager.rebuild(this._monitorWorkspaceMap);
         });
         this._signalIds.push({ obj: this._settings, id: flatIndicatorId });
+
+        // Focus-follows-mouse flips Mutter's focus-mode, apply it live
+        const focusFollowsId = this._settings.connect('changed::focus-follows-mouse', () => {
+            const follow = this._settings.get_boolean('focus-follows-mouse');
+            console.log(`[MultiMonitorsWorkspace] Focus follows mouse: ${follow}`);
+            this._applyFocusMode();
+        });
+        this._signalIds.push({ obj: this._settings, id: focusFollowsId });
 
         // Listen for workspace-modifier setting changes
         const modifierSettingId = this._settings.connect('changed::workspace-modifier', () => {

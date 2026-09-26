@@ -668,6 +668,22 @@ export default class MultiMonitorsWorkspacePreferences extends ExtensionPreferen
             Gio.SettingsBindFlags.DEFAULT
         );
 
+        // Focus follows mouse
+        const focusFollowsRow = new Adw.SwitchRow({
+            title: 'Focus Follows Mouse',
+            subtitle: 'Focus a window as soon as the mouse moves over it, no click needed. ' +
+                'Switching Mutter\'s focus-mode; the old value is restored when the ' +
+                'extension is disabled',
+        });
+        behaviorGroup.add(focusFollowsRow);
+
+        settings.bind(
+            'focus-follows-mouse',
+            focusFollowsRow,
+            'active',
+            Gio.SettingsBindFlags.DEFAULT
+        );
+
         // Raise on cycle focus toggle
         const raiseOnCycleRow = new Adw.SwitchRow({
             title: 'Raise Window on Cycle Focus',
