@@ -190,6 +190,20 @@
       <description>JSON array of {"monitor":N,"workspace":N} entries defining which workspace each monitor displays after login. An empty list means automatic: the primary monitor keeps the workspace that is currently active and every other monitor gets the next free one. Workspaces are zero-based indices as used everywhere else, so workspace 1 in the UI is index 0</description>
     </key>
 
+    <!-- Which workspace a given application is placed on when it opens -->
+    <key name="app-workspace-map" type="s">
+      <default>'[]'</default>
+      <summary>Workspace per application at startup</summary>
+      <description>JSON array of {"wmClass":"NAME","workspace":N,"scope":"startup|always","maximize":BOOL} entries. A window whose WM_CLASS matches is moved to that workspace without ever activating it, so the view never jumps, and maximized right after the move when the rule says so. scope 'startup' only applies within the first 30 seconds after login, which covers autostarted apps and nothing else; scope 'always' applies every time the app opens. 'maximize' is optional and falls back to the maximize-app-windows default. Workspaces are zero-based indices, so workspace 1 in the UI is index 0. An empty list disables the feature</description>
+    </key>
+
+    <!-- Default for whether a window placed by an app rule opens maximized -->
+    <key name="maximize-app-windows" type="b">
+      <default>false</default>
+      <summary>Default for new application rules: open maximized</summary>
+      <description>Whether a newly added app-workspace-map rule gets 'maximize' set. A rule without its own 'maximize' field follows this value, a rule that sets it ignores this value. Windows are only ever maximized, never restored</description>
+    </key>
+
     <!-- Cycle focus within current workspace -->
     <key name="mmw-cycle-focus-forward" type="as">
       <default><![CDATA[[]]]></default>

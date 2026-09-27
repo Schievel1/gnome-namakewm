@@ -32,6 +32,33 @@ const OFFSCREEN_Y = -20000;
 // Directions for relative (neighbouring) monitor navigation
 const ADJACENT_DIRECTIONS = ['left', 'right', 'up', 'down'];
 
+// How long after enable() a rule with scope "startup" still counts as
+// autostart placement. Autostarted apps appear within the first seconds of the
+// session, so this only needs to cover the login burst - keeping it short means
+// an app you open yourself later is not dragged away unexpectedly.
+const APP_RULE_STARTUP_SECONDS = 30;
+
+// Valid values for the "scope" field of an app-workspace-map entry
+const APP_RULE_SCOPES = ['startup', 'always'];
+
+// The keys a WM_CLASS is looked up under, most specific first: the string
+// itself, lowercased, then the part after the last dot.
+//
+// The second key is what makes an app id usable as a rule. A GApplication-based
+// app - every modern GNOME app - reports its app id as WM_CLASS, so a rule
+// configured from the desktop file says "org.gnome.Nautilus" while a window may
+// equally report the bare "nautilus" (that is what the program name gives you).
+// Accepting both spellings means the rule works either way, and the desktop
+// entry no longer has to be guessed exactly right.
+function wmClassLookupKeys(wmClass) {
+    const keys = [wmClass.toLowerCase()];
+    const lastDot = wmClass.lastIndexOf('.');
+    if (lastDot > 0 && lastDot < wmClass.length - 1) {
+        keys.push(wmClass.slice(lastDot + 1).toLowerCase());
+    }
+    return keys;
+}
+
 export default class MultiMonitorsWorkspaceExtension extends Extension {
     _settings = null;
     _wmSettings = null;
@@ -42,6 +69,9 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
     // monitorIndex -> workspaceIndex (which WS each monitor is displaying)
     _monitorWorkspaceMap = new Map();
+
+    // wmClass (lowercased) -> { workspace, scope } from app-workspace-map
+    _appWorkspaceMap = new Map();
 
     // windowId -> { relX, relY } (relative position within monitor for hidden windows)
     _savedWindowPositions = new Map();
@@ -56,6 +86,24 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
     // Saved mapping before disable (for restore after enable)
     // Key: monitorIndex, Value: logicalWs
     _savedMappingBeforeDisable = new Map();
+
+    // Windows already handled by an app-workspace rule, so a rule is applied
+    // at most once per window. This is what keeps the login sweep from pulling
+    // a window back after the user has deliberately moved it somewhere else.
+    // Key: windowId
+    _rulePlacedWindows = new Set();
+
+    // Windows a rule has seen go away, filled from the window's own "unmanaged"
+    // signal. Deferred work on a rule window has to be able to tell "the window
+    // is not on screen yet" from "the window is gone", and _isWindowAlive()
+    // cannot: check_alive() also answers false for a window that has not drawn
+    // a buffer yet, which is exactly the state an autostarted app is in while
+    // the rule is still placing it.
+    // Key: windowId
+    _unmanagedRuleWindows = new Set();
+
+    // Monotonic deadline after which scope "startup" rules stop applying.
+    _startupDeadline = 0;
 
     // Track last focused window per workspace (for focus restoration)
     // Key: wsIndex, Value: windowId
@@ -141,6 +189,17 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         this._applyFocusMode();
         this._initializeMapping();
         this._registerKeybindings();
+
+        // App placement rules. The deadline has to be set before any signal is
+        // connected, otherwise a window created in between would be judged
+        // against a deadline of 0 and every "startup" rule would already look
+        // expired.
+        this._appWorkspaceMap = this._readAppWorkspaceMap();
+        this._startupDeadline =
+            GLib.get_monotonic_time() + APP_RULE_STARTUP_SECONDS * GLib.USEC_PER_SEC;
+        this._debugLog(`App workspace rules: ${this._appWorkspaceMap.size}, ` +
+            `startup rules valid for ${APP_RULE_STARTUP_SECONDS}s`);
+
         this._connectSignals();
 
         this._debugLog('=== Extension Enabled ===');
@@ -170,6 +229,24 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         }
 
         console.log('[MultiMonitorsWorkspace] Extension enabled successfully');
+
+        // Catch windows that were mapped before the signals above existed.
+        // Autostarted apps are launched in parallel to the shell coming up, so
+        // some of them are simply never seen by window-created. Without this
+        // sweep they would stay on the workspace Mutter gave them - WS1.
+        //
+        // Spread over the whole startup window rather than run once: on a slow
+        // login a tray app may only show its window several seconds in, and a
+        // single early pass would miss it. Windows already handled are skipped,
+        // so repeating is harmless.
+        if (this._appWorkspaceMap.size > 0) {
+            for (const delay of [1500, 5000, 12000, 22000]) {
+                this._addManagedTimeout(delay, () => {
+                    this._sweepExistingWindows(`enable+${delay}ms`);
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+        }
 
         // Restore secondary windows after a delay
         // This handles re-enable after screen unlock
@@ -230,6 +307,9 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         // Note: Do NOT clear _savedWindowPositions - it's needed for correct window placement after unlock
         this._recentlyProcessedWindows.clear();
         this._windowsPendingPlacement.clear();
+        this._rulePlacedWindows.clear();
+        this._unmanagedRuleWindows.clear();
+        this._appWorkspaceMap = new Map();
         // Note: Do NOT clear _savedMappingBeforeDisable - it's needed for restore after enable
         // Note: Do NOT clear _lastWindowPerWorkspace - it's useful for focus restoration after unlock
         this._interfaceSettings = null;
@@ -594,6 +674,94 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         }
 
         return result;
+    }
+
+    // Returns Map<wmClass, {workspace, scope}> for the app-workspace-map
+    // setting. WM_CLASS is matched case-insensitively: the .desktop files
+    // spell it "firefox" while the running window may report "Firefox", and
+    // making the user type the exact casing of an implementation detail is a
+    // pointless trap. Malformed entries and duplicate keys are dropped so a bad
+    // value degrades to "no rule" instead of misplacing windows.
+    _readAppWorkspaceMap() {
+        const result = new Map();
+
+        let raw = [];
+        try {
+            const stored = this._settings.get_string('app-workspace-map');
+            if (stored && stored.trim() !== '') {
+                raw = JSON.parse(stored);
+            }
+        } catch (e) {
+            console.error('[MultiMonitorsWorkspace] Failed to parse app-workspace-map:', e.message);
+            return result;
+        }
+
+        if (!Array.isArray(raw)) {
+            if (raw.length > 0)
+                console.error('[MultiMonitorsWorkspace] app-workspace-map is not an array, ignoring');
+            return result;
+        }
+
+        for (const entry of raw) {
+            const wmClass = entry?.wmClass;
+            const ws = entry?.workspace;
+            if (typeof wmClass !== 'string' || wmClass.trim() === '') {
+                console.error(`[MultiMonitorsWorkspace] Ignoring app-workspace-map entry without wmClass: ${JSON.stringify(entry)}`);
+                continue;
+            }
+            if (!Number.isInteger(ws) || ws < 0 || ws > 9) {
+                console.error(`[MultiMonitorsWorkspace] Ignoring app-workspace-map entry with invalid workspace: ${JSON.stringify(entry)}`);
+                continue;
+            }
+            // An unknown scope is treated as "startup", the more conservative of
+            // the two: it only ever applies during the login burst.
+            const scope = APP_RULE_SCOPES.includes(entry?.scope) ? entry.scope : 'startup';
+
+            // "maximize" is optional per rule. A rule that does not carry it
+            // follows the global default, which is what lets an existing rule
+            // list pick up a changed default without being rewritten. A rule
+            // that carries it - including an explicit false - always wins.
+            const maximize = typeof entry?.maximize === 'boolean'
+                ? entry.maximize
+                : this._settings.get_boolean('maximize-app-windows');
+
+            const keys = wmClassLookupKeys(wmClass);
+            if (result.has(keys[0])) {
+                console.error(`[MultiMonitorsWorkspace] WM_CLASS "${wmClass}" configured twice, first wins`);
+                continue;
+            }
+
+            // The first key is the WM_CLASS itself and always wins a collision;
+            // the extra keys only fill gaps, so a rule for "com.example.Foo"
+            // cannot be shadowed by a later, unrelated "Foo".
+            for (const key of keys) {
+                if (!result.has(key)) result.set(key, { workspace: ws, scope, maximize });
+            }
+        }
+
+        return result;
+    }
+
+    // The app-workspace rule for a window, or null if the app is not mapped.
+    // Rules with scope "startup" stop applying once the startup deadline has
+    // passed, so they only ever catch autostarted windows.
+    _getAppWorkspaceRule(window) {
+        const wmClass = window.get_wm_class?.();
+        if (!wmClass) return null;
+
+        let rule = null;
+        for (const key of wmClassLookupKeys(wmClass)) {
+            rule = this._appWorkspaceMap.get(key);
+            if (rule) break;
+        }
+        if (!rule) return null;
+
+        if (rule.scope === 'startup' && GLib.get_monotonic_time() >= this._startupDeadline) {
+            this._debugLog(`App rule for ${wmClass} expired (scope=startup)`);
+            return null;
+        }
+
+        return { wmClass, ...rule };
     }
 
     // Hand out distinct workspaces to the monitors that do not have one yet.
@@ -1166,7 +1334,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                     isVisibleHere = !window.is_hidden();
                 }
 
-                if (windowMonitor === monitorIndex && isVisibleHere) {
+                    if (windowMonitor === monitorIndex && isVisibleHere) {
                     // Focus the window and warp to its center
                     const rect = window.get_frame_rect();
                     targetX = Math.floor(rect.x + rect.width / 2);
@@ -1174,6 +1342,8 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                     focusedWindow = window;
                     this._debugLog(`Restored focus to last window: "${window.get_title()}" on WS${wsIndex}`);
                 } else if (!isVisibleHere) {
+
+
                     this._debugLog(`Window "${window.get_title()}" not visible here, clearing record`);
                     this._lastWindowPerWorkspace.delete(wsIndex);
                 }
@@ -1329,7 +1499,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 const activeWs = global.workspace_manager.get_active_workspace();
                 const isOnActiveWs = window.located_on_workspace(activeWs);
 
-                if (windowMonitor === monitorIndex && isOnActiveWs) {
+                    if (windowMonitor === monitorIndex && isOnActiveWs) {
                     // Focus the window and warp to its center
                     const rect = window.get_frame_rect();
                     const targetX = Math.floor(rect.x + rect.width / 2);
@@ -1342,6 +1512,8 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                     this._debugLog(`Restored focus to last window: "${window.get_title()}" on WS${wsIndex}`);
                     return;
                 }
+
+
             }
             // Window not found, moved, or not on active WS - clear the record
             this._lastWindowPerWorkspace.delete(wsIndex);
@@ -1646,6 +1818,23 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         });
         this._signalIds.push({ obj: this._settings, id: modifierSettingId });
 
+        // Re-read the app placement rules when they change in the preferences.
+        // Windows already handled keep their old placement, new ones pick the
+        // new rules up right away.
+        const appMapId = this._settings.connect('changed::app-workspace-map', () => {
+            this._appWorkspaceMap = this._readAppWorkspaceMap();
+            this._debugLog(`App workspace rules reloaded: ${this._appWorkspaceMap.size} entries`);
+            // Forget which windows were handled under the old rules, otherwise a
+            // newly added rule could never fire for an already open window.
+        this._rulePlacedWindows.clear();
+        this._unmanagedRuleWindows.clear();
+
+            if (this._appWorkspaceMap.size > 0) {
+                this._sweepExistingWindows('rules-changed');
+            }
+        });
+        this._signalIds.push({ obj: this._settings, id: appMapId });
+
         // Listen for new window creation
         const id3 = global.display.connect('window-created', (display, window) => {
             this._onWindowCreated(window, 'window-created');
@@ -1661,6 +1850,12 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             }
         });
         this._signalIds.push({ obj: global.window_manager, id: id4 });
+
+        // NOTE: there is deliberately no global "unmap" handler here.
+        // global.window_manager is a Shell.Wm, which only has a "map" signal -
+        // connecting "unmap" to it throws and would abort the rest of
+        // _connectSignals(). Cleanup is done per window instead, see
+        // _markRulePlaced().
 
         // NOTE: a Main.sessionMode 'updated' handler used to be connected here.
         // It was dead code: metadata.json declares no "session-modes", so GNOME
@@ -1890,6 +2085,21 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             return GLib.SOURCE_REMOVE;
         });
 
+        // An app-workspace rule takes precedence over the pointer-based
+        // placement below. The window gets parked on the configured workspace
+        // and is never activated, so the view stays exactly where the user is
+        // looking even though the window belongs to a different one.
+        const appRule = this._getAppWorkspaceRule(window);
+        if (appRule) {
+            this._markRulePlaced(window, windowId);
+            // A rule fires at most once per window, so drop the dedup entry
+            // again right away. Leaving it would make the 1s lock swallow the
+            // 'map' signal and with it the retries the placement needs.
+            this._recentlyProcessedWindows.delete(windowId);
+            this._placeWindowByAppRule(window, appRule, windowId);
+            return;
+        }
+
         // Capture pointer position NOW (before warp-pointer-to-focus can move it)
         const [capturedPointerX, capturedPointerY] = global.get_pointer();
         const targetMonitor = this._getMonitorAtPointer();
@@ -1904,6 +2114,290 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
             this._moveWindowToMonitor(window, targetMonitor, windowId);
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    // Walk every window that currently exists and apply an app-workspace rule
+    // to the ones that are still on their original workspace.
+    //
+    // Windows already handled by a rule are skipped via _rulePlacedWindows, so
+    // this can never yank a window back once the user has moved it themselves.
+    _sweepExistingWindows(label) {
+        if (this._appWorkspaceMap.size === 0) return;
+
+        const actors = global.get_window_actors();
+        this._debugLog(`APP RULE SWEEP (${label}): checking ${actors.length} windows`);
+
+        for (const actor of actors) {
+            const window = actor.get_meta_window();
+            if (!window) continue;
+
+            const windowType = window.get_window_type();
+            if (windowType !== Meta.WindowType.NORMAL) continue;
+            if (window.is_skip_taskbar()) continue;
+
+            const windowId = this._getWindowId(window);
+            if (this._rulePlacedWindows.has(windowId)) continue;
+
+            const rule = this._getAppWorkspaceRule(window);
+            if (!rule) continue;
+
+            // Only intervene while the window is still where it was created.
+            // If it is already on a workspace of its own, something moved it
+            // deliberately and that decision wins.
+            if (window.get_workspace() !== global.workspace_manager.get_active_workspace()) {
+                this._debugLog(
+                    `APP RULE SWEEP: "${rule.wmClass}" already on WS` +
+                    `${window.get_workspace()?.index()}, not WS${rule.workspace} - leaving it alone`);
+                this._markRulePlaced(window, windowId);
+                continue;
+            }
+
+            this._debugLog(`APP RULE SWEEP: applying "${rule.wmClass}" -> WS${rule.workspace}`);
+            this._markRulePlaced(window, windowId);
+            this._placeWindowByAppRule(window, rule, windowId);
+        }
+    }
+
+    // Remember that a rule has already been applied to this window.
+    //
+    // Cleanup is attached to the window's own "unmanaged" signal rather than to
+    // a global one, for two reasons. global.window_manager is a Shell.Wm, which
+    // only has "map", so a global "unmap" handler does not exist. And MetaWindow
+    // has no "unmap" either - its signals are configure, focus, raised, shown,
+    // size-changed, position-changed, workspace-changed, highest-scale-monitor-
+    // changed, unmanaging and unmanaged.
+    _markRulePlaced(window, windowId) {
+        this._rulePlacedWindows.add(windowId);
+        this._unmanagedRuleWindows.delete(windowId);
+
+        try {
+            window.connect('unmanaged', () => {
+                this._rulePlacedWindows.delete(windowId);
+                this._unmanagedRuleWindows.add(windowId);
+            });
+        } catch (e) {
+            // Not fatal: the set is cleared on disable anyway, it would just
+            // keep one stale entry per window for the rest of the session.
+            this._debugLog(`APP RULE: cannot observe unmanaged on ${windowId}: ${e.message}`);
+        }
+    }
+
+    // Whether a window a rule is working on still exists.
+    //
+    // Deliberately not _isWindowAlive(): that asks whether Mutter considers the
+    // window ready to be focused, which is false for a window that has not drawn
+    // its first buffer yet - the normal state of an autostarted app seconds
+    // into login, and precisely when a rule is placing it. The "unmanaged"
+    // signal connected in _markRulePlaced() is the actual "this window is gone"
+    // event, and it cannot be missed.
+    _isRuleWindowAlive(windowId) {
+        return !this._unmanagedRuleWindows.has(windowId);
+    }
+
+    // Place a window on the workspace an app rule asks for, and nothing else.
+    //
+    // The rule's workspace index only means something together with the
+    // monitor-workspace mapping: _monitorWorkspaceMap says which monitor shows
+    // which workspace. So the window has to end up on the monitor that shows
+    // the requested workspace, not on the primary.
+    //
+    // Getting this wrong is invisible rather than wrong-looking, which is what
+    // made it so hard to see: under workspaces-only-on-primary only the primary
+    // binds its windows to the active workspace, every window on a secondary
+    // monitor is sticky and therefore visible on whatever workspace is active.
+    // Parking a rule window on the primary put it on the requested workspace
+    // (change_workspace() succeeds and reports success) while the primary kept
+    // showing a different one, so the window sat there hidden until a workspace
+    // switch dragged it onto the right monitor. Parking it on the monitor that
+    // actually shows the workspace makes it sticky and visible there, which is
+    // exactly what the user sees for every other window of that workspace.
+    //
+    // When no monitor is mapped to the requested workspace there is nowhere to
+    // put it, so the primary is used and the window is bound to the workspace
+    // itself - it shows up whenever the user switches to that workspace.
+    //
+    // The window is never activated: meta_window_activate() switches to the
+    // window's workspace, and the user wants an app to start quietly on e.g.
+    // workspace 5 without being taken there. move_frame() and change_workspace()
+    // do not change the active workspace on their own.
+    _placeWindowOnWorkspace(window, wmClass, workspace) {
+        this._ensureWorkspaceExists(workspace);
+        const wsObj = global.workspace_manager.get_workspace_by_index(workspace);
+        if (!wsObj) {
+            this._debugLog(`APP RULE: "${wmClass}" cannot get WS${workspace}`);
+            return false;
+        }
+
+        const primaryMonitor = global.display.get_primary_monitor();
+        const hostMonitor = this._getMonitorForWorkspace(workspace);
+        const targetMonitor = hostMonitor ?? primaryMonitor;
+        const isPrimaryTarget = targetMonitor === primaryMonitor;
+
+        this._debugLog(
+            `APP RULE: "${wmClass}" -> WS${workspace} hosted by M${targetMonitor}` +
+            `${isPrimaryTarget ? ' (primary)' : ''}`);
+
+        const rect = window.get_frame_rect();
+        const sourceMonitor = this._getWindowMonitor(window);
+
+        if (sourceMonitor !== targetMonitor) {
+            // Mutter derives a window's monitor from its position, so moving the
+            // frame is what actually reassigns it. Keep the position relative to
+            // the current monitor so the window lands where the user expects,
+            // then clamp it onto the target.
+            const targetGeo = global.display.get_monitor_geometry(targetMonitor);
+            const sourceGeo = sourceMonitor >= 0
+                ? global.display.get_monitor_geometry(sourceMonitor)
+                : null;
+            let newX = sourceGeo ? targetGeo.x + (rect.x - sourceGeo.x) : targetGeo.x;
+            let newY = sourceGeo ? targetGeo.y + (rect.y - sourceGeo.y) : targetGeo.y;
+            newX = Math.max(targetGeo.x, Math.min(newX, targetGeo.x + targetGeo.width - rect.width));
+            newY = Math.max(targetGeo.y, Math.min(newY, targetGeo.y + targetGeo.height - rect.height));
+
+            try {
+                window.move_frame(false, newX, newY);
+            } catch (e) {
+                this._debugLog(`APP RULE: "${wmClass}" move_frame(M${targetMonitor}) threw: ${e.message}`);
+                return false;
+            }
+        }
+
+        // Only the primary binds windows to a workspace. On a secondary monitor
+        // the window is sticky now, and change_workspace() is a no-op there -
+        // asking for it anyway would only produce a misleading mismatch below.
+        if (isPrimaryTarget) {
+            try {
+                window.change_workspace(wsObj);
+            } catch (e) {
+                this._debugLog(`APP RULE: "${wmClass}" change_workspace(WS${workspace}) threw: ${e.message}`);
+                return false;
+            }
+        }
+
+        const landedMonitor = this._getWindowMonitor(window);
+        const landedWs = window.get_workspace()?.index() ?? -1;
+        const landed = isPrimaryTarget ? landedWs === workspace : landedMonitor === targetMonitor;
+        this._debugLog(
+            `APP RULE: "${wmClass}" wanted WS${workspace} on M${targetMonitor}, ` +
+            `now WS${landedWs} on M${landedMonitor}`);
+
+        if (!landed) {
+            console.warn(
+                `[MultiMonitorsWorkspace] app rule had no effect for ${wmClass}: ` +
+                `wanted WS${workspace} on M${targetMonitor}, ` +
+                `got WS${landedWs} on M${landedMonitor}`);
+            return false;
+        }
+        return true;
+    }
+
+    _placeWindowByAppRule(window, rule, windowId) {
+        const { wmClass, workspace, scope, maximize } = rule;
+
+        this._debugLog(
+            `APP RULE: "${wmClass}" -> WS${workspace} (scope=${scope}, maximize=${maximize})`);
+
+        // Mark pending so warp-pointer-to-focus stays suppressed for this
+        // window; cleared again once placement is done.
+        this._windowsPendingPlacement.set(windowId, this._getMonitorAtPointer());
+
+        // Autostarted windows are regularly not fully realised when
+        // window-created fires, and a single attempt at idle is not enough to
+        // land one reliably. Retry over ~1.3s and stop as soon as the window
+        // really sits on the target workspace.
+        const delays = [0, 300, 1000];
+        let attempt = 0;
+
+        const tryPlace = () => {
+            let done = false;
+            try {
+                done = this._placeWindowOnWorkspace(window, wmClass, workspace);
+            } catch (e) {
+                this._debugLog(`APP RULE: "${wmClass}" placement threw: ${e.message}`);
+                console.warn(`[MultiMonitorsWorkspace] App rule placement failed: ${e.message}`);
+            }
+
+            this._windowsPendingPlacement.delete(windowId);
+
+            attempt++;
+            if (done) {
+                this._debugLog(`APP RULE: "${wmClass}" placed on WS${workspace} on attempt ${attempt}`);
+                this._maximizeAfterRulePlacement(window, windowId, wmClass, maximize);
+                return;
+            }
+            if (attempt >= delays.length) {
+                this._debugLog(`APP RULE: "${wmClass}" gave up after ${attempt} attempts`);
+                return;
+            }
+
+            this._addManagedTimeout(delays[attempt], tryPlace);
+        };
+
+        this._addManagedIdle(tryPlace);
+    }
+
+    // Maximize a rule-placed window, if its rule says so.
+    //
+    // This cannot run in the same tick as the move: Mutter maximises onto the
+    // monitor the window is on *now*, and a move_frame() issued in the same tick
+    // has not been through the monitor update yet - the window would end up
+    // maximised on the monitor it came from.
+    //
+    // Hence the retries, which have to run well past the point where the app has
+    // even drawn its first buffer: a maximise request to a window that is not
+    // realised yet is accepted and then dropped, and an autostarted app can take
+    // a second or two to get there. Each attempt re-issues the request, so it does
+    // not matter which one is the one that sticks.
+    //
+    // Only ever maximizes. A window that is already maximized, and a window whose
+    // app refuses to be maximized, are both left exactly as they are - unmaximizing
+    // would mean touching windows the user maximized themselves.
+    _maximizeAfterRulePlacement(window, windowId, wmClass, maximize) {
+        if (!maximize) return;
+
+        const delays = [50, 200, 500, 1000, 2000];
+        let attempt = 0;
+
+        const tryMaximize = () => {
+            if (!this._isRuleWindowAlive(windowId)) {
+                this._debugLog(`APP RULE: "${wmClass}" gone before it could be maximized`);
+                return;
+            }
+
+            let maximized = false;
+            try {
+                // is_maximized() and a parameterless maximize() since mutter 49;
+                // get_maximized() and the MetaMaximizeFlags parameter are gone.
+                // Same convention as the window swap in _swapWithNeighbor().
+                maximized = window.is_maximized();
+                if (!maximized) {
+                    // user_op = true: this is a deliberate placement, not something
+                    // the user did by clicking the titlebar, and apps that remember
+                    // geometry across restarts should store the maximized one.
+                    window.maximize();
+                    maximized = window.is_maximized();
+                }
+            } catch (e) {
+                this._debugLog(`APP RULE: "${wmClass}" maximize threw: ${e.message}`);
+                return;
+            }
+
+            attempt++;
+            if (maximized) {
+                this._debugLog(`APP RULE: "${wmClass}" maximized on attempt ${attempt} ` +
+                    `(M${this._getWindowMonitor(window)})`);
+                return;
+            }
+            if (attempt >= delays.length) {
+                this._debugLog(`APP RULE: "${wmClass}" did not accept maximize, leaving it as it is`);
+                return;
+            }
+
+            this._debugLog(`APP RULE: "${wmClass}" not maximized yet, retrying in ${delays[attempt]}ms`);
+            this._addManagedTimeout(delays[attempt], tryMaximize);
+        };
+
+        this._addManagedTimeout(delays[attempt], tryMaximize);
     }
 
     // Move window to a specific monitor (used for new window placement)
@@ -2504,18 +2998,25 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         return null;
     }
 
-    // Is this Meta.Window still usable?
+    // Whether this Meta.Window is still usable.
     //
-    // There is no Meta.Window.is_alive() *method*. "is-alive" is a read-only
-    // GObject *property* of type boolean, so calling it throws
-    // "window.is_alive is not a function". The only real method is
-    // check_alive(timestamp), which returns a boolean and additionally reaps
-    // the window if it has died since the last check.
+    // check_alive(timestamp) is the only safe test here. "is-alive" exists as a
+    // read-only GObject property, but reading it dereferences the window's C
+    // object directly, and this is called in loops over get_window_actors(),
+    // where an entry can already have been freed. check_alive() reaps a window
+    // that died since the last check, which a property read does not, so
+    // reading the property turned this into a use-after-free and took the shell
+    // down with it.
+    //
+    // The placement paths no longer gate on this at all - they let the
+    // operations report a dead window by throwing.
     _isWindowAlive(window) {
         if (!window) return false;
+
         try {
             return window.check_alive(global.get_current_time()) === true;
         } catch (e) {
+            this._debugLog(`check_alive() failed: ${e.message}`);
             return false;
         }
     }
