@@ -105,6 +105,12 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
     // Monotonic deadline after which scope "startup" rules stop applying.
     _startupDeadline = 0;
 
+    // Workspace a window is currently being bound to, used to let a newer
+    // request cancel an older one that is still retrying. See
+    // _bindWindowToWorkspace().
+    // Key: windowId, Value: workspace index
+    _pendingWsBindings = new Map();
+
     // Track last focused window per workspace (for focus restoration)
     // Key: wsIndex, Value: windowId
     _lastWindowPerWorkspace = new Map();
@@ -309,6 +315,7 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         this._windowsPendingPlacement.clear();
         this._rulePlacedWindows.clear();
         this._unmanagedRuleWindows.clear();
+        this._pendingWsBindings.clear();
         this._appWorkspaceMap = new Map();
         // Note: Do NOT clear _savedMappingBeforeDisable - it's needed for restore after enable
         // Note: Do NOT clear _lastWindowPerWorkspace - it's useful for focus restoration after unlock
@@ -1717,12 +1724,13 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
 
         // Secondary monitor windows are sticky (workspaces-only-on-primary), so
         // there we assign the current global workspace; on primary we assign
-        // the workspace the monitor is actually showing.
+        // the workspace the monitor is actually showing. The primary case has to
+        // go through _bindWindowToWorkspace(): the move onto the primary is what
+        // decides the workspace, a change_workspace() in this tick is ignored
+        // while the window is still sticky, and Mutter would then drop the window
+        // on the active workspace instead of the one that was asked for.
         if (targetMonitor === primaryMonitor) {
-            const targetWsObj = global.workspace_manager.get_workspace_by_index(targetWs);
-            if (targetWsObj) {
-                focusedWindow.change_workspace(targetWsObj);
-            }
+            this._bindWindowToWorkspace(focusedWindow, targetWs, title);
         } else if (currentGlobalWs) {
             focusedWindow.change_workspace(currentGlobalWs);
         }
@@ -2879,6 +2887,73 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
         }
     }
 
+    // Bind a window to a workspace after moving it to the primary, and keep
+    // asking until it really is on that workspace.
+    //
+    // Mutter decides a window's workspace while it processes the monitor change,
+    // not when move_to_monitor() returns. A change_workspace() issued in the
+    // same tick still sees the window in its old state - sticky, on a secondary
+    // monitor - where it is ignored, and Mutter then drops the window onto
+    // whichever workspace is active at that moment. The move succeeds, the
+    // window is on the primary, and it is on the wrong workspace: that is how
+    // the window belonging to WS4 becomes a WS1 window as soon as its monitor
+    // moves on to another workspace.
+    //
+    // A pending binding is cancelled by a newer one for the same window, so a
+    // second switch within the retry window wins instead of the stale retry
+    // dragging the window back.
+    //
+    // Deliberately without an _isWindowAlive() guard: check_alive() is false for
+    // a window that has not drawn a buffer yet, which is the normal state of a
+    // window in the middle of a monitor move. The try/catch is what catches a
+    // window that is actually gone.
+    _bindWindowToWorkspace(window, wsIndex, label) {
+        const windowId = this._getWindowId(window);
+        this._pendingWsBindings.set(windowId, wsIndex);
+
+        const delays = [50, 250, 700];
+        let attempt = 0;
+
+        const tryBind = () => {
+            if (this._pendingWsBindings.get(windowId) !== wsIndex) {
+                this._debugLog(`  "${label}" WS${wsIndex} binding superseded, abandoning`);
+                return GLib.SOURCE_REMOVE;
+            }
+
+            let landed = -1;
+            try {
+                landed = window.get_workspace()?.index() ?? -1;
+                if (landed !== wsIndex) {
+                    const wsObj = global.workspace_manager.get_workspace_by_index(wsIndex);
+                    if (!wsObj) return GLib.SOURCE_REMOVE;
+                    window.change_workspace(wsObj);
+                    landed = window.get_workspace()?.index() ?? -1;
+                }
+            } catch (e) {
+                this._debugLog(`  binding "${label}" to WS${wsIndex} failed: ${e.message}`);
+                return GLib.SOURCE_REMOVE;
+            }
+
+            attempt++;
+            if (landed === wsIndex) {
+                this._debugLog(`  "${label}" on WS${wsIndex} (attempt ${attempt})`);
+                this._pendingWsBindings.delete(windowId);
+                return GLib.SOURCE_REMOVE;
+            }
+            if (attempt >= delays.length) {
+                this._debugLog(
+                    `  "${label}" would not stay on WS${wsIndex}, it is on WS${landed}`);
+                this._pendingWsBindings.delete(windowId);
+                return GLib.SOURCE_REMOVE;
+            }
+
+            this._addManagedTimeout(delays[attempt], tryBind);
+            return GLib.SOURCE_REMOVE;
+        };
+
+        this._addManagedTimeout(delays[attempt], tryBind);
+    }
+
     // Secondary monitor simple switch: coordinate-based (workspaces-only-on-primary mode)
     // In this mode, secondary monitor windows are automatically sticky (WS=-1),
     // but we track which WS each monitor displays via _monitorWorkspaceMap.
@@ -2921,13 +2996,13 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
 
-            // Assign to previousWs so it will be hidden (global WS is different)
-            const previousWsObj = global.workspace_manager.get_workspace_by_index(previousWs);
-            if (previousWsObj) {
-                window.change_workspace(previousWsObj);
-            }
+            // Bind it to previousWs so it will be hidden (global WS is
+            // different). Deferred: the binding only sticks once Mutter has
+            // processed the move onto the primary, see
+            // _bindWindowToWorkspace().
+            this._bindWindowToWorkspace(window, previousWs, shortTitle);
 
-            this._debugLog(`  -> "${shortTitle}" moved to primary (${newX},${newY}) size ${width}x${height}, assigned to WS${previousWs}`);
+            this._debugLog(`  -> "${shortTitle}" moved to primary (${newX},${newY}) size ${width}x${height}, belongs to WS${previousWs}`);
         }
 
         // Step 2: Bring windows from targetWs to this secondary monitor
@@ -3375,10 +3450,12 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
 
-            // Only change WS when moving TO primary
+            // Only bind a WS when moving TO primary; the move onto the primary
+            // is what decides the workspace, so this cannot be a plain
+            // change_workspace() here. See _bindWindowToWorkspace().
             if (monitor2 === primaryMonitor && newGlobalWsObj) {
-                window.change_workspace(newGlobalWsObj);
-                this._debugLog(`  "${shortTitle}" -> M${monitor2}(PRIMARY) at (${newX},${newY}) ${width}x${height}, WS changed to ${newGlobalWs}`);
+                this._bindWindowToWorkspace(window, newGlobalWs, shortTitle);
+                this._debugLog(`  "${shortTitle}" -> M${monitor2}(PRIMARY) at (${newX},${newY}) ${width}x${height}, bound to WS${newGlobalWs}`);
             } else {
                 // Moving to secondary: no WS change needed (windows are sticky in this mode)
                 this._debugLog(`  "${shortTitle}" -> M${monitor2}(secondary) at (${newX},${newY}) ${width}x${height}, no WS change`);
@@ -3408,10 +3485,12 @@ export default class MultiMonitorsWorkspaceExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
 
-            // Only change WS when moving TO primary
+            // Only bind a WS when moving TO primary; the move onto the primary
+            // is what decides the workspace, so this cannot be a plain
+            // change_workspace() here. See _bindWindowToWorkspace().
             if (monitor1 === primaryMonitor && newGlobalWsObj) {
-                window.change_workspace(newGlobalWsObj);
-                this._debugLog(`  "${shortTitle}" -> M${monitor1}(PRIMARY) at (${newX},${newY}) ${width}x${height}, WS changed to ${newGlobalWs}`);
+                this._bindWindowToWorkspace(window, newGlobalWs, shortTitle);
+                this._debugLog(`  "${shortTitle}" -> M${monitor1}(PRIMARY) at (${newX},${newY}) ${width}x${height}, bound to WS${newGlobalWs}`);
             } else {
                 // Moving to secondary: no WS change needed (windows are sticky in this mode)
                 this._debugLog(`  "${shortTitle}" -> M${monitor1}(secondary) at (${newX},${newY}) ${width}x${height}, no WS change`);
